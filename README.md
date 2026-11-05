@@ -1,8 +1,8 @@
 # GitHub Webhook Processing Platform
 
 A multi-tenant GitHub webhook platform under development. This first step provides
-only a local FastAPI application and PostgreSQL 16 with psycopg 3. Webhook
-processing, application tables, queues, and AWS infrastructure are future work.
+a local FastAPI application, PostgreSQL 16 with psycopg 3, and an initial SQL
+schema. Webhook processing, queues, and AWS infrastructure are future work.
 
 ## Prerequisites
 
@@ -78,6 +78,76 @@ docker compose ps
 docker compose logs api db
 ```
 
+## Apply the initial database migration
+
+Start the containers first and confirm the database health endpoint succeeds.
+Apply this migration **once**, from the project directory in PowerShell:
+
+```powershell
+Get-Content -Raw migrations/001_initial_schema.sql | docker compose exec -T db sh -c 'psql -X --set=ON_ERROR_STOP=1 --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"'
+```
+
+The shell inside the container expands its existing database environment
+variables; no password needs to appear in the command. The migration runs in a
+transaction, and `ON_ERROR_STOP` makes SQL errors stop execution. An error before
+commit rolls back the schema changes. Check `$LASTEXITCODE` immediately after
+the command: zero indicates success.
+
+This adds tables to the existing database without resetting the volume. It does
+not run automatically on container startup. There is no migration tracking table:
+apply numbered migrations in order and keep track of which succeeded. Reapplying
+this file fails on existing tables; do not reset data or hide that error with
+`IF NOT EXISTS`.
+
+To inspect the tables interactively:
+
+```powershell
+docker compose exec db sh -c 'psql -X --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"'
+```
+
+At the `psql` prompt:
+
+```text
+\dt
+\d rules
+\d events
+\d deliveries
+\d outbox
+\q
+```
+
+The schema contains:
+
+| Table | Responsibility |
+|---|---|
+| `tenants` | Tenant records |
+| `sources` | Tenant-owned GitHub sources and secret references |
+| `destinations` | Tenant-owned Slack destinations and webhook URL references |
+| `rules` | Exact GitHub event type routing from a source to a destination |
+| `events` | GitHub payloads, unique delivery identifiers, and source ownership |
+| `deliveries` | One job per event/destination, its originating rule, retries, leases, and result |
+| `outbox` | One publication job per delivery, linked to the same event |
+
+Composite foreign keys prevent cross-tenant links and ensure a delivery's rule
+uses the event's source and the selected destination. Deletes are restricted when
+rows are referenced. Unique `(source_id, github_delivery_id)` prevents duplicate
+GitHub ingestion; unique `(event_id, destination_id)` prevents multiple delivery
+jobs to the same destination for one event.
+
+The explicit `outbox` table follows the Step 2 decision, replacing the earlier
+architecture suggestion to reuse delivery rows for publication. Future ingestion
+must insert the event, deliveries, and outbox rows in one transaction. Publication
+and notification status are independent. The publisher will initially use
+transactional row locking; worker lease tokens identify individual claims so
+stale workers cannot overwrite a newer claim. These processes are not implemented
+yet. Management API key storage is deferred to the authentication step.
+
+Secret reference columns must identify recoverable values in a secure secret
+store; they must not contain raw GitHub secrets or Slack webhook URLs. The secret
+store implementation is deferred. Error fields should contain only sanitized
+messages, never secrets or sensitive payloads. Applications must still authenticate
+requests and scope queries by tenant; foreign keys do not provide read isolation.
+
 ## Stop
 
 ```powershell
@@ -113,4 +183,5 @@ volume if you need to initialize with different settings, then start again.
 | `.env.example` | Example local configuration to copy to `.env` |
 | `.dockerignore` | Excludes secrets and generated files from the build context |
 | `.gitignore` | Excludes local secrets, environments, and generated files from Git |
+| `migrations/001_initial_schema.sql` | Initial tables, relationships, constraints, and indexes |
 | `docs/architecture.md` | Planned system architecture and development stages |
