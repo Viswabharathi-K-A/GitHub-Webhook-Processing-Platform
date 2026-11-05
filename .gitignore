@@ -1,0 +1,35 @@
+# Local environment configuration (keep the example).
+.env
+.env.*
+!.env.example
+
+# Credentials and secrets.
+.aws/
+credentials
+credentials.*
+secrets
+secrets.*
+*.pem
+*.key
+
+# Python environments and generated files.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
+*.log
+
+# Editor and operating system files.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
