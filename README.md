@@ -5,6 +5,26 @@ a local FastAPI application, PostgreSQL 16 with psycopg 3, and an initial SQL
 schema. Signed webhook ingestion and an outbox publisher are implemented.
 The delivery worker and AWS infrastructure remain future work.
 
+## Remaining roadmap
+
+The detailed [architecture and roadmap](docs/architecture.md#7-development-roadmap)
+distinguish implemented behavior from planned work:
+
+| Stage | Goal |
+|---|---|
+| 2 — Delivery worker | Slack-only delivery with PostgreSQL idempotency/leases, bounded retries, SQS visibility and practical DLQ recovery |
+| 3 — Tenant management | Hashed API keys, tenant-scoped configuration, protected secret references, isolation tests and simple CI |
+| 4 — Temporary AWS deployment | One readable Terraform root, minimal ECS/RDS/SQS/ALB infrastructure, scoped IAM and HTTPS in us-west-2 |
+| 5 — Operational verification | Useful logs/alarms, failure and recovery checks, bounded load measurements and lightweight deployment procedures |
+| 6 — Portfolio and cleanup | Record real evidence, document tradeoffs, destroy and inspect billable resources |
+
+Security and tests are part of every stage. Delivery attempts are at least once;
+Slack notifications can duplicate after uncertain outcomes. The project does
+not promise exactly-once delivery. Use tenant API keys rather than OAuth/Cognito,
+and keep explicit SQL and the existing codebase instead of adding frameworks.
+The AWS plan is a temporary demonstration with documented availability and
+networking tradeoffs, not a continuously running production service.
+
 ## Prerequisites
 
 - Docker Desktop running with Linux containers and Docker Compose v2.
@@ -138,8 +158,8 @@ jobs to the same destination for one event.
 The explicit `outbox` table follows the Step 2 decision, replacing the earlier
 architecture suggestion to reuse delivery rows for publication. Ingestion
 inserts the event, deliveries, and outbox rows in one transaction. Publication
-and notification status are independent. The publisher will initially use
-transactional row locking; worker lease tokens identify individual claims so
+and notification status are independent. The publisher uses
+transactional row locking; worker lease tokens will identify individual claims so
 stale workers cannot overwrite a newer claim. The publisher is implemented;
 the delivery worker is not. Management API key storage is deferred to the authentication step.
 
@@ -171,23 +191,138 @@ Set these values in `.env` before enabling the publisher:
 - `SQS_QUEUE_URL`: the existing standard queue URL.
 - `SQS_ENDPOINT_URL`: blank for AWS, or a reachable local emulator endpoint.
 
-Compose does not create a queue or start an emulator. Inside containers, use the
-emulator's network hostname, not host `localhost`. Local emulator credentials
-can be dummy values accepted by that emulator. For an existing AWS development
+Compose provides an optional [Moto server](https://docs.getmoto.org/en/latest/docs/server_mode.html) SQS emulator, reachable inside the Compose
+network at `http://sqs:5000`. It has no published host port and uses disposable
+in-memory queues. Inside containers, use `sqs`, not host `localhost`.
+Local emulator credentials are dummy values `test` / `test`. For an existing AWS development
 queue, Compose forwards `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optional
 `AWS_SESSION_TOKEN` from your environment or uncommitted `.env`. It does not mount
 host AWS profiles. Never put credentials in committed files. AWS sends can incur
 charges; the runtime role/user needs `sqs:SendMessage` on the selected queue.
 ECS should use a task role rather than static keys.
 
-After applying the initial migration and configuring the queue:
+The Compose publisher still depends on the local emulator's health check even
+when configured for AWS. A blank endpoint selects AWS; explicitly set
+`http://sqs:5000` for local publishing.
+
+For a local publisher demonstration, set `SQS_ENDPOINT_URL=http://sqs:5000`,
+`AWS_ACCESS_KEY_ID=test`, `AWS_SECRET_ACCESS_KEY=test`, and
+`AWS_DEFAULT_REGION=us-west-2` in your uncommitted `.env`. Clear any AWS session
+token. Start the emulator and create a queue using the existing test image:
 
 ```powershell
-docker compose --profile publisher up --build -d publisher
+docker compose --profile test build tests
+docker compose --profile publisher up -d sqs
+docker compose --profile test run --rm tests python -c "import boto3; s=boto3.client('sqs', endpoint_url='http://sqs:5000', region_name='us-west-2', aws_access_key_id='test', aws_secret_access_key='test'); print(s.create_queue(QueueName='deliveries')['QueueUrl'])"
+```
+
+Set `SQS_QUEUE_URL` to the returned URL. After applying the initial migration and
+setting a nonempty `GITHUB_WEBHOOK_SECRET_LOCAL` in `.env`, start the API and
+publisher. Source rows must reference `env:GITHUB_WEBHOOK_SECRET_LOCAL` for this
+Compose configuration. The integration tests generate their own source, rule,
+secret, and signed request without modifying your `.env` or public schema.
+
+```powershell
+docker compose --profile publisher up --build -d api publisher
 docker compose logs publisher
+```
+
+### Standalone local demonstration
+
+After the queue creation, migration, environment setup, and startup above, create
+the routing configuration below in the local database. This writes demo records;
+run it once per demonstration. Repeating it creates another tenant and source.
+The destination is a placeholder reference: this stage sends to SQS, not Slack.
+
+Open `psql`:
+
+```powershell
+docker compose exec db sh -c 'psql -X --set=ON_ERROR_STOP=1 --username="$POSTGRES_USER" --dbname="$POSTGRES_DB"'
+```
+
+Paste this SQL into `psql`. `\gset` stores the generated IDs, so the example does
+not assume an empty database or IDs starting at one:
+
+```sql
+BEGIN;
+INSERT INTO tenants (name) VALUES ('local-demo') RETURNING id AS demo_tenant_id \gset
+INSERT INTO sources (tenant_id, name, webhook_secret_ref)
+VALUES (:demo_tenant_id, 'local-github', 'env:GITHUB_WEBHOOK_SECRET_LOCAL')
+RETURNING id AS demo_source_id \gset
+INSERT INTO destinations (tenant_id, name, webhook_url_ref)
+VALUES (:demo_tenant_id, 'local-placeholder', 'env:SLACK_WEBHOOK_URL_LOCAL')
+RETURNING id AS demo_destination_id \gset
+INSERT INTO rules (tenant_id, source_id, destination_id, event_type)
+VALUES (:demo_tenant_id, :demo_source_id, :demo_destination_id, 'push');
+COMMIT;
+\echo Demo source ID: :demo_source_id
+\q
+```
+
+Copy the printed source ID into the prompt below. The Python code runs inside
+the API container, reads its configured secret without printing it, and signs
+the exact bytes sent over HTTP. It submits the same delivery twice:
+
+```powershell
+$demoSourceId = Read-Host 'Demo source ID'
+@'
+import hashlib
+import hmac
+import os
+import sys
+import urllib.request
+from uuid import uuid4
+
+source_id = int(sys.argv[1])
+body = b'{"ref":"refs/heads/main","repository":{"name":"local-demo"}}'
+secret = os.environ['GITHUB_WEBHOOK_SECRET_LOCAL'].encode()
+headers = {
+    'Content-Type': 'application/json',
+    'X-GitHub-Event': 'push',
+    'X-GitHub-Delivery': str(uuid4()),
+    'X-Hub-Signature-256': 'sha256=' + hmac.new(secret, body, hashlib.sha256).hexdigest(),
+}
+for _ in range(2):
+    request = urllib.request.Request(
+        f'http://localhost:8000/webhooks/github/{source_id}', data=body, headers=headers
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        print(response.status, response.read().decode())
+'@ | docker compose exec -T api python - $demoSourceId
+```
+
+Expect `202 {"status":"accepted"}` followed by `200 {"status":"duplicate"}`.
+In `psql`, replace `YOUR_SOURCE_ID` below with that source ID:
+
+```sql
+SELECT e.id AS event_id, d.id AS delivery_id, d.status AS delivery_status,
+       o.status AS publication_status, o.attempt_count
+FROM events e
+JOIN deliveries d ON d.event_id = e.id AND d.tenant_id = e.tenant_id
+JOIN outbox o ON o.delivery_id = d.id AND o.tenant_id = d.tenant_id
+WHERE e.source_id = YOUR_SOURCE_ID;
+```
+
+For one execution of the Python example, expect one row: delivery `pending` and,
+after the publisher processes it, publication `published`. Check the local queue:
+
+```powershell
+docker compose --profile test run --rm tests python -c "import boto3; s=boto3.client('sqs', endpoint_url='http://sqs:5000', region_name='us-west-2', aws_access_key_id='test', aws_secret_access_key='test'); q=s.get_queue_url(QueueName='deliveries')['QueueUrl']; print([m['Body'] for m in s.receive_message(QueueUrl=q, MaxNumberOfMessages=10, WaitTimeSeconds=2).get('Messages', [])])"
+```
+
+Expect a message containing the matching `delivery_id`. Receiving temporarily
+hides messages; this inspection does not delete them. Existing demo messages may
+also appear. These manual demo commands are instructions, not a claim that a
+real GitHub or Slack demonstration has been executed.
+
+Stop the publisher when finished:
+
+```powershell
 docker compose stop publisher
 ```
 
+Queue creation is explicit; restarting/recreating Moto can lose its queues and
+messages. Recreate the demo queue as needed. This differs from durable AWS SQS.
 The publisher profile is optional, so normal API/database startup does not require
 SQS credentials. To inspect progress with `psql`, query:
 
@@ -196,12 +331,13 @@ SELECT id, delivery_id, status, attempt_count, next_attempt_at, last_error
 FROM outbox ORDER BY id;
 ```
 
-For a manual queue smoke test, submit a valid signed webhook matching a rule,
-confirm its outbox row becomes published, and receive the message from the local
-emulator or authorized development queue. Its body should contain only the numeric
-`delivery_id`. This manual end-to-end check has not yet been performed.
+The automated integration suite below exercises a complete signed HTTP webhook
+through an actual Uvicorn process, PostgreSQL, a separate publisher process, and
+real boto3 requests to Moto. It also checks invalid signatures and duplicate
+webhook handling. A separate Compose-container demo is optional; no manual
+GitHub repository webhook delivery is claimed by these tests.
 
-## Publisher tests
+## Publisher and ingestion tests
 
 With the database running, run:
 
@@ -215,12 +351,64 @@ the existing PostgreSQL service with a unique temporary schema per test, apply
 the migration there, and drop only that schema afterward. The database user must
 be allowed to create schemas. Use local disposable development data, not a remote
 production database. An interrupted test may leave a `test_outbox_...` schema for
-manual inspection and cleanup.
+manual inspection and cleanup. Ingestion tests use the same isolation approach
+with `test_ingestion_...` schemas.
 
-The SQS sender is a small fake: tests do not contact AWS or require a queue.
-They cover success, delayed retry, future jobs, concurrent row locking, rollback
-recovery, and duplicate publication after a successful send followed by rollback.
-Ingestion tests and an emulator integration test remain to be added.
+Compose starts the local emulator automatically for tests and waits for its
+health check. Five focused tests use a fake SQS sender; three integration tests
+use real boto3 HTTP requests with explicit local endpoints and dummy credentials.
+Each integration test creates and deletes unique queues. No AWS access is needed.
+Without `TEST_SQS_ENDPOINT_URL`, the three emulator tests are skipped.
+
+Coverage includes success, delayed retry, future jobs, competing database locks,
+rollback recovery, and the duplicate window after sending before commit. Process
+tests cover invalid/valid signatures, duplicate ingestion, missing-queue failure
+and recovery on the real retry schedule, an unreachable endpoint, graceful stop,
+and restart with both pending and published jobs. Child processes are terminated
+and awaited before their schemas and queues are removed.
+
+`tests/test_webhook_ingestion.py` additionally tests disabled/nonmatching routing,
+concurrent duplicate requests, full rollback on delivery/outbox insertion failure,
+cross-tenant rule constraints, and invalid/oversized payloads. It calls the actual
+ASGI application with HTTPX and uses PostgreSQL without requiring another server
+process or an additional testing dependency.
+
+Combined suite verified locally on November 10, 2026: **22 tests passed in
+31.48 seconds**, including 14 ingestion cases and the eight existing publisher
+tests. The development image build and Compose configuration validation passed.
+The standalone manual demo instructions above were not executed in this run.
+
+Historical publisher-only verification on November 10, 2026 (before the separate
+ingestion tests were added): **8 tests passed in 24.93 seconds** using
+PostgreSQL 16 and `motoserver/moto:5.1.21`. The test image built successfully and
+Compose configuration validation passed. The end-to-end test observed HTTP 401
+for an invalid signature, 202 for a valid webhook, and 200 for its duplicate,
+with one event, delivery, outbox job, and queue message. All publisher subprocesses
+stopped gracefully; restart tests preserved pending work and skipped published
+work. A post-run inspection found zero remaining test schemas and zero emulator
+queues. No AWS resources or Git commits were created for this verification.
+
+The optional manual emulator-stop commands below have not been executed. The
+automated suite instead verifies a real missing-queue HTTP error followed by
+scheduled recovery, and a refused endpoint followed by publisher restart.
+Moto is an emulator; AWS IAM enforcement, durable queue behavior, and actual
+GitHub network delivery are outside this local verification.
+
+For optional manual outage verification with a configured demo publisher:
+
+```powershell
+docker compose stop sqs
+# Submit a signed webhook matching an enabled rule; inspect outbox and logs.
+docker compose logs --tail 30 publisher
+docker compose --profile publisher start sqs
+# Recreate the demo queue if Moto lost its in-memory state.
+docker compose --profile publisher restart publisher
+```
+
+Confirm pending attempts increase during the outage, `last_error` is sanitized,
+and the same job becomes published after recovery. A published row must not be
+resent simply because the publisher restarts. This manual emulator-stop scenario
+is distinct from the automated missing-queue and refused-endpoint tests.
 
 ## Stop
 
@@ -253,6 +441,7 @@ volume if you need to initialize with different settings, then start again.
 | `main.py` | FastAPI health endpoints and signed GitHub webhook ingestion |
 | `outbox_publisher.py` | PostgreSQL polling, SQS publication, and retries |
 | `tests/test_outbox_publisher.py` | PostgreSQL-backed publisher behavior tests |
+| `tests/test_webhook_ingestion.py` | Routing, concurrent deduplication, rollback, tenant constraints, and payload validation tests |
 | `requirements.txt` | FastAPI, Uvicorn, psycopg, and boto3 dependencies |
 | `Dockerfile` | Python 3.13 application image running as a non-root user |
 | `compose.yaml` | API, PostgreSQL 16, readiness check, networking, and storage |

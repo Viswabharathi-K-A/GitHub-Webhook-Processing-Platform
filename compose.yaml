@@ -9,6 +9,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      GITHUB_WEBHOOK_SECRET_LOCAL: ${GITHUB_WEBHOOK_SECRET_LOCAL:-}
     depends_on:
       db:
         condition: service_healthy
@@ -33,6 +34,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      sqs:
+        condition: service_healthy
 
   tests:
     profiles: [test]
@@ -45,9 +48,21 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      TEST_SQS_ENDPOINT_URL: http://sqs:5000
     depends_on:
       db:
         condition: service_healthy
+      sqs:
+        condition: service_healthy
+
+  sqs:
+    profiles: [test, publisher]
+    image: motoserver/moto:5.1.21
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/')"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   db:
     image: postgres:16
