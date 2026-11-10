@@ -2,7 +2,8 @@
 
 A multi-tenant GitHub webhook platform under development. This first step provides
 a local FastAPI application, PostgreSQL 16 with psycopg 3, and an initial SQL
-schema. Webhook processing, queues, and AWS infrastructure are future work.
+schema. Signed webhook ingestion and an outbox publisher are implemented.
+The delivery worker and AWS infrastructure remain future work.
 
 ## Prerequisites
 
@@ -135,18 +136,91 @@ GitHub ingestion; unique `(event_id, destination_id)` prevents multiple delivery
 jobs to the same destination for one event.
 
 The explicit `outbox` table follows the Step 2 decision, replacing the earlier
-architecture suggestion to reuse delivery rows for publication. Future ingestion
-must insert the event, deliveries, and outbox rows in one transaction. Publication
+architecture suggestion to reuse delivery rows for publication. Ingestion
+inserts the event, deliveries, and outbox rows in one transaction. Publication
 and notification status are independent. The publisher will initially use
 transactional row locking; worker lease tokens identify individual claims so
-stale workers cannot overwrite a newer claim. These processes are not implemented
-yet. Management API key storage is deferred to the authentication step.
+stale workers cannot overwrite a newer claim. The publisher is implemented;
+the delivery worker is not. Management API key storage is deferred to the authentication step.
 
 Secret reference columns must identify recoverable values in a secure secret
 store; they must not contain raw GitHub secrets or Slack webhook URLs. The secret
 store implementation is deferred. Error fields should contain only sanitized
 messages, never secrets or sensitive payloads. Applications must still authenticate
 requests and scope queries by tenant; foreign keys do not provide read isolation.
+
+## Outbox publisher
+
+The publisher runs separately from the API and processes one due outbox job per
+transaction. It holds a `FOR UPDATE SKIP LOCKED` row lock while sending to SQS,
+then marks the row published only after the send succeeds. Other publishers skip
+locked rows. Delivery notification status is unchanged.
+
+Failed sends remain pending and retry after 5 seconds, doubling to a maximum of
+300 seconds. There is no attempt limit that silently discards jobs. Idle polling
+waits one second; database failures trigger a five-second reconnect delay.
+Logs contain job IDs and outcomes, not payloads, secrets, or raw exception messages.
+Shutdown finishes the current bounded send/transaction before exiting.
+
+A crash after SQS accepts a message but before the database commit can produce
+duplicates. The future worker must tolerate these; publication is not exactly once.
+
+Set these values in `.env` before enabling the publisher:
+
+- `AWS_DEFAULT_REGION=us-west-2` (Oregon).
+- `SQS_QUEUE_URL`: the existing standard queue URL.
+- `SQS_ENDPOINT_URL`: blank for AWS, or a reachable local emulator endpoint.
+
+Compose does not create a queue or start an emulator. Inside containers, use the
+emulator's network hostname, not host `localhost`. Local emulator credentials
+can be dummy values accepted by that emulator. For an existing AWS development
+queue, Compose forwards `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optional
+`AWS_SESSION_TOKEN` from your environment or uncommitted `.env`. It does not mount
+host AWS profiles. Never put credentials in committed files. AWS sends can incur
+charges; the runtime role/user needs `sqs:SendMessage` on the selected queue.
+ECS should use a task role rather than static keys.
+
+After applying the initial migration and configuring the queue:
+
+```powershell
+docker compose --profile publisher up --build -d publisher
+docker compose logs publisher
+docker compose stop publisher
+```
+
+The publisher profile is optional, so normal API/database startup does not require
+SQS credentials. To inspect progress with `psql`, query:
+
+```sql
+SELECT id, delivery_id, status, attempt_count, next_attempt_at, last_error
+FROM outbox ORDER BY id;
+```
+
+For a manual queue smoke test, submit a valid signed webhook matching a rule,
+confirm its outbox row becomes published, and receive the message from the local
+emulator or authorized development queue. Its body should contain only the numeric
+`delivery_id`. This manual end-to-end check has not yet been performed.
+
+## Publisher tests
+
+With the database running, run:
+
+```powershell
+docker compose --profile test build tests
+docker compose --profile test run --rm tests
+```
+
+The development image includes pytest; the production image does not. Tests use
+the existing PostgreSQL service with a unique temporary schema per test, apply
+the migration there, and drop only that schema afterward. The database user must
+be allowed to create schemas. Use local disposable development data, not a remote
+production database. An interrupted test may leave a `test_outbox_...` schema for
+manual inspection and cleanup.
+
+The SQS sender is a small fake: tests do not contact AWS or require a queue.
+They cover success, delayed retry, future jobs, concurrent row locking, rollback
+recovery, and duplicate publication after a successful send followed by rollback.
+Ingestion tests and an emulator integration test remain to be added.
 
 ## Stop
 
@@ -176,8 +250,10 @@ volume if you need to initialize with different settings, then start again.
 
 | File | Responsibility |
 |---|---|
-| `main.py` | FastAPI application and the two health endpoints |
-| `requirements.txt` | FastAPI, Uvicorn, and psycopg dependencies |
+| `main.py` | FastAPI health endpoints and signed GitHub webhook ingestion |
+| `outbox_publisher.py` | PostgreSQL polling, SQS publication, and retries |
+| `tests/test_outbox_publisher.py` | PostgreSQL-backed publisher behavior tests |
+| `requirements.txt` | FastAPI, Uvicorn, psycopg, and boto3 dependencies |
 | `Dockerfile` | Python 3.13 application image running as a non-root user |
 | `compose.yaml` | API, PostgreSQL 16, readiness check, networking, and storage |
 | `.env.example` | Example local configuration to copy to `.env` |
