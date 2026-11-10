@@ -142,3 +142,56 @@ For conceptual questions, answer directly and teach from first principles when n
 
 ## 11. Commit the current stage after I ask for next step
 
+# 12. Testing Guidelines
+
+Testing is required, but simplicity and maintainability are the highest priorities.
+
+### General Principles
+
+- Write tests for important application behavior, not every function or line of code.
+- Keep tests short, readable, and easy to understand.
+- Use `pytest` as the primary testing framework.
+- Prefer straightforward test functions with descriptive names.
+- Avoid complicated mocking frameworks, excessive fixtures, custom testing utilities, or unnecessary abstractions.
+- Do not introduce new testing dependencies unless they are genuinely needed.
+- Do not aim for arbitrary code coverage percentages.
+- Tests should validate observable behavior rather than internal implementation details.
+
+### What to Test
+
+Prioritize tests for:
+
+1. **Webhook security:** Valid and invalid GitHub HMAC-SHA256 signatures.
+2. **Idempotency:** Duplicate GitHub delivery IDs must not create duplicate records.
+3. **Database transactions:** Failed operations must not leave partially committed records.
+4. **Event routing:** Events must match the correct enabled rules and destinations.
+5. **Outbox publishing:** Successful publication and retryable failures.
+6. **SQS worker:** Successful Slack notifications, failures, and retry handling.
+
+### Database Testing
+
+- Prefer testing database-dependent behavior against the existing PostgreSQL Docker Compose service.
+- Do not introduce a separate database technology solely for testing.
+- Keep test data isolated and clean it up after testing.
+- Avoid creating an elaborate test database framework.
+
+### Testing Workflow
+
+- Add or update tests only when implementing or modifying relevant functionality.
+- Run relevant existing tests after making changes.
+- Clearly report which tests passed, failed, or were not executed.
+- Never claim that tests passed unless they were actually run.
+- If a test requires unavailable infrastructure or credentials, explain the limitation rather than inventing results.
+- Do not modify production code solely to make tests easier unless the change also improves the design.
+
+### Development Priorities
+
+Follow this order:
+
+1. Correct application behavior.
+2. Security and reliability.
+3. Simple, maintainable implementation.
+4. Focused automated tests.
+5. Additional optimizations only when justified.
+
+The goal is a reliable, production-inspired backend project that is easy to understand, maintain, and explain during technical interviews—not an unnecessarily complex testing architecture.
