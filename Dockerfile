@@ -9,7 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 RUN useradd --create-home appuser
-COPY main.py outbox_publisher.py ./
+COPY main.py outbox_publisher.py delivery_worker.py slack_sender.py ./
 USER appuser
 
 EXPOSE 8000

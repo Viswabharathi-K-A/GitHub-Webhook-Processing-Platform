@@ -2,8 +2,9 @@
 
 A multi-tenant GitHub webhook platform under development. This first step provides
 a local FastAPI application, PostgreSQL 16 with psycopg 3, and an initial SQL
-schema. Signed webhook ingestion and an outbox publisher are implemented.
-The delivery worker and AWS infrastructure remain future work.
+schema. Signed webhook ingestion, an outbox publisher, and the delivery worker's
+claim-and-success path are implemented. Worker retry policy, DLQ recovery,
+Compose worker service integration, and AWS infrastructure remain future work.
 
 ## Remaining roadmap
 
@@ -160,8 +161,9 @@ architecture suggestion to reuse delivery rows for publication. Ingestion
 inserts the event, deliveries, and outbox rows in one transaction. Publication
 and notification status are independent. The publisher uses
 transactional row locking; worker lease tokens will identify individual claims so
-stale workers cannot overwrite a newer claim. The publisher is implemented;
-the delivery worker is not. Management API key storage is deferred to the authentication step.
+stale workers cannot overwrite a newer claim. The publisher and initial delivery
+worker are implemented; worker failure classification and bounded retries remain
+future work. Management API key storage is deferred to the authentication step.
 
 Secret reference columns must identify recoverable values in a secure secret
 store; they must not contain raw GitHub secrets or Slack webhook URLs. The secret
@@ -337,7 +339,92 @@ real boto3 requests to Moto. It also checks invalid signatures and duplicate
 webhook handling. A separate Compose-container demo is optional; no manual
 GitHub repository webhook delivery is claimed by these tests.
 
-## Publisher and ingestion tests
+## Initial delivery worker
+
+`delivery_worker.py` receives one SQS message at a time using five-second long
+polling and a 90-second visibility timeout. In a short PostgreSQL transaction it
+claims a due delivery with a fresh UUID token and a 60-second lease, increments
+its attempt count, and commits before HTTP. It looks up the event and destination
+through tenant-matching joins. The notification contains only the event type and
+event/delivery IDs, not the full GitHub payload.
+
+| Delivery state | Current worker behavior |
+|---|---|
+| `succeeded` or `failed` | Delete the received message without sending to Slack |
+| Active lease or future retry time | Keep the message and defer visibility until eligible |
+| Due `pending` or expired lease | Claim with a new token, then check the destination and ownership before sending |
+| Successful Slack response | Commit `succeeded`, clear the lease, then delete the message |
+| Lease lost before completion | Do not record success or delete the message |
+| Invalid message or missing delivery | Log a sanitized reason and leave the message unacknowledged |
+
+`slack_sender.py` supports local environment secret references of the form
+`env:SLACK_WEBHOOK_URL_TENANT_<tenant_id>_<NAME>`. A tenant cannot resolve a
+reference in another tenant's namespace. The secret value must be an HTTPS URL
+on exactly `hooks.slack.com`, with the `/services/<id>/<id>/<token>` path and
+port 443. Credentials in URLs, query strings, fragments, alternate hosts, and
+redirects are rejected. The sender uses public IPv4 addresses only; validation
+happens in the resolver used by the connector, with no second DNS lookup between
+validation and connection. TLS certificate and hostname verification remain
+enabled. Proxy environment variables are ignored.
+
+The added `aiohttp` dependency provides a ten-second total request timeout,
+including waiting for DNS and the response body. The system DNS resolver runs
+in a thread: cancellation stops the request, but a stuck OS lookup can delay
+interpreter shutdown. This is not a hard process-exit deadline. Database statements
+have their own three-second timeout. The current timing values are starting
+settings, not a throughput or availability guarantee. See the
+[aiohttp client reference](https://docs.aiohttp.org/en/stable/client_reference.html)
+for connector and timeout behavior and
+[Slack's incoming webhook documentation](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/)
+for the POST/response contract.
+
+**This is the success-path stage, not the complete retry worker.** On an invalid
+destination, unavailable secret, timeout, or unsuccessful Slack response, the
+worker records a sanitized reason when it still owns the lease, keeps the SQS
+message, and exits with code 1 for inspection. It does not mark failure terminal
+or automatically classify HTTP errors yet. Restarting after visibility/lease
+expiry can attempt delivery again; a timeout or crash after Slack accepted a
+request can therefore produce duplicate notifications. Do not configure automatic
+restart for send failures until retry limits and failure policy are implemented.
+Database/SQS errors use a five-second reconnect/retry delay. A deletion failure
+after success is safe: a later receipt sees the terminal database state and skips
+the HTTP call.
+
+Still remaining: retryable/permanent error classification, attempt limits,
+`Retry-After` handling, DLQ configuration/recovery, SSM secret resolution, and a
+dedicated Compose worker service. `docs/architecture.md` describes the full target
+design, including these features that are not yet implemented.
+
+### Optional standalone worker invocation
+
+This command sends real Slack messages when configured with a real webhook.
+It has not been executed as part of local verification. First finish the local
+database/queue/publisher setup above. The publisher must run separately to put
+delivery IDs on the queue. For a destination belonging to tenant 1, register
+`env:SLACK_WEBHOOK_URL_TENANT_1_DEMO` as its `webhook_url_ref` and set the matching
+`SLACK_WEBHOOK_URL_TENANT_1_DEMO` environment variable in your shell to the secret
+Slack URL using your normal secure secret-entry method. Use your actual tenant ID;
+the earlier demo placeholder `env:SLACK_WEBHOOK_URL_LOCAL` is not a valid worker
+reference. Keep the URL out of SQL, logs, committed files, and shell history.
+
+Reuse the publisher's database/SQS environment with a different command:
+
+```powershell
+docker compose --profile publisher run --rm --build -e SLACK_WEBHOOK_URL_TENANT_1_DEMO publisher python delivery_worker.py
+```
+
+The `-e` option forwards the existing shell variable without putting its value
+in the command. Compose does not automatically pass arbitrary variables from
+`.env` to this container. The existing `SQS_QUEUE_URL` must identify the queue
+created earlier, and local publishing/consumption uses `SQS_ENDPOINT_URL=http://sqs:5000`
+with dummy AWS credentials. No worker service or cloud resources are provisioned
+by this implementation.
+
+An eventual AWS worker task role needs `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
+and `sqs:ChangeMessageVisibility` scoped to its delivery queue. The publisher's
+send-only permission is insufficient for the worker.
+
+## Tests
 
 With the database running, run:
 
@@ -353,6 +440,21 @@ be allowed to create schemas. Use local disposable development data, not a remot
 production database. An interrupted test may leave a `test_outbox_...` schema for
 manual inspection and cleanup. Ingestion tests use the same isolation approach
 with `test_ingestion_...` schemas.
+
+`tests/test_delivery_worker.py` reuses the publisher suite's isolated schema and
+Moto fixtures. It covers competing claims, expiry and stale-token rejection,
+deferred/terminal jobs, failed sends, completion/deletion failures, and a real
+publisher-to-Moto-to-worker-to-local-HTTP flow with duplicate suppression after
+success. `tests/test_slack_sender.py` tests secret isolation, URL/DNS restrictions,
+the actual IP passed to the connector, proxy bypass prevention, redirect refusal,
+and DNS/response timeouts. Local HTTP URLs are wired in only by tests; production
+has no option to disable destination validation. No real Slack messages are sent.
+
+Verified locally on November 10, 2026: **72 tests passed in 36.90 seconds** with
+PostgreSQL 16, Moto, and aiohttp 3.14.5. The test image built successfully and
+Compose configuration validation passed. This verifies the initial worker and
+sender plus the existing ingestion/publisher behavior; it does not verify real
+Slack delivery, AWS permissions, or the remaining retry/DLQ design.
 
 Compose starts the local emulator automatically for tests and waits for its
 health check. Five focused tests use a fake SQS sender; three integration tests
@@ -373,7 +475,8 @@ cross-tenant rule constraints, and invalid/oversized payloads. It calls the actu
 ASGI application with HTTPX and uses PostgreSQL without requiring another server
 process or an additional testing dependency.
 
-Combined suite verified locally on November 10, 2026: **22 tests passed in
+Historical ingestion/publisher suite verification on November 10, 2026:
+**22 tests passed in
 31.48 seconds**, including 14 ingestion cases and the eight existing publisher
 tests. The development image build and Compose configuration validation passed.
 The standalone manual demo instructions above were not executed in this run.
@@ -440,9 +543,13 @@ volume if you need to initialize with different settings, then start again.
 |---|---|
 | `main.py` | FastAPI health endpoints and signed GitHub webhook ingestion |
 | `outbox_publisher.py` | PostgreSQL polling, SQS publication, and retries |
+| `delivery_worker.py` | SQS reception, database leases, and successful delivery completion |
+| `slack_sender.py` | Tenant-bound local secrets and restricted Slack HTTP delivery |
 | `tests/test_outbox_publisher.py` | PostgreSQL-backed publisher behavior tests |
 | `tests/test_webhook_ingestion.py` | Routing, concurrent deduplication, rollback, tenant constraints, and payload validation tests |
-| `requirements.txt` | FastAPI, Uvicorn, psycopg, and boto3 dependencies |
+| `tests/test_delivery_worker.py` | Worker state, ordering, and local queue-to-HTTP tests |
+| `tests/test_slack_sender.py` | Secret, destination, DNS, and HTTP behavior tests |
+| `requirements.txt` | FastAPI, Uvicorn, psycopg, boto3, and aiohttp dependencies |
 | `Dockerfile` | Python 3.13 application image running as a non-root user |
 | `compose.yaml` | API, PostgreSQL 16, readiness check, networking, and storage |
 | `.env.example` | Example local configuration to copy to `.env` |
