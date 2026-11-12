@@ -37,6 +37,38 @@ services:
       sqs:
         condition: service_healthy
 
+  worker:
+    profiles: [worker]
+    build: .
+    command: ["python", "delivery_worker.py"]
+    stop_grace_period: 30s
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-west-2}
+      SQS_QUEUE_URL: ${SQS_QUEUE_URL:-}
+      SQS_ENDPOINT_URL: ${SQS_ENDPOINT_URL:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      SLACK_WEBHOOK_URL_TENANT_1_DEMO: ${SLACK_WEBHOOK_URL_TENANT_1_DEMO:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      sqs:
+        condition: service_healthy
+
+  queue-init:
+    profiles: [setup]
+    build: .
+    command: ["python", "setup_local_sqs.py"]
+    depends_on:
+      sqs:
+        condition: service_healthy
+
   tests:
     profiles: [test]
     build:
@@ -56,7 +88,7 @@ services:
         condition: service_healthy
 
   sqs:
-    profiles: [test, publisher]
+    profiles: [test, publisher, worker, setup]
     image: motoserver/moto:5.1.21
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/')"]

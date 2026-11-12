@@ -3,8 +3,8 @@
 A multi-tenant GitHub webhook platform under development. This first step provides
 a local FastAPI application, PostgreSQL 16 with psycopg 3, and an initial SQL
 schema. Signed webhook ingestion, an outbox publisher, and a delivery worker with
-bounded retries are implemented. DLQ recovery,
-Compose worker service integration, and AWS infrastructure remain future work.
+bounded retries are implemented, with Compose worker integration and explicit
+local queue/DLQ setup. Operator recovery and AWS infrastructure remain future work.
 
 ## Remaining roadmap
 
@@ -203,22 +203,45 @@ host AWS profiles. Never put credentials in committed files. AWS sends can incur
 charges; the runtime role/user needs `sqs:SendMessage` on the selected queue.
 ECS should use a task role rather than static keys.
 
-The Compose publisher still depends on the local emulator's health check even
+The Compose publisher and worker depend on the local emulator's health check even
 when configured for AWS. A blank endpoint selects AWS; explicitly set
 `http://sqs:5000` for local publishing.
 
 For a local publisher demonstration, set `SQS_ENDPOINT_URL=http://sqs:5000`,
 `AWS_ACCESS_KEY_ID=test`, `AWS_SECRET_ACCESS_KEY=test`, and
 `AWS_DEFAULT_REGION=us-west-2` in your uncommitted `.env`. Clear any AWS session
-token. Start the emulator and create a queue using the existing test image:
+token. Create or configure both local queues explicitly:
 
 ```powershell
-docker compose --profile test build tests
-docker compose --profile publisher up -d sqs
-docker compose --profile test run --rm tests python -c "import boto3; s=boto3.client('sqs', endpoint_url='http://sqs:5000', region_name='us-west-2', aws_access_key_id='test', aws_secret_access_key='test'); print(s.create_queue(QueueName='deliveries')['QueueUrl'])"
+docker compose --profile setup run --rm --build queue-init
 ```
 
-Set `SQS_QUEUE_URL` to the returned URL. After applying the initial migration and
+`queue-init` waits for Moto, runs `setup_local_sqs.py`, and exits. The script uses
+only `http://sqs:5000`, region `us-west-2`, and fixed dummy credentials, ignoring
+ambient AWS endpoints and HTTP proxies. It does not create AWS resources.
+
+| Queue | Settings |
+|---|---|
+| `deliveries` | Standard queue; visibility 90 seconds; retention 4 days; redrive after 10 unacknowledged receives |
+| `deliveries-dlq` | Standard dead-letter queue; retention 14 days |
+
+The DLQ is created first, then its ARN is attached to the delivery queue's redrive
+policy. Rerunning setup updates attributes without deleting or purging queues.
+Existing messages are preserved by the script; normal retention expiry still
+applies, including if you shorten a previously configured retention period.
+Moto remains in-memory: rerun setup after it loses its state. Neither publisher
+nor worker starts queue setup automatically.
+
+The script prints `SQS_QUEUE_URL` and a separate DLQ URL. Copy the delivery URL
+into `.env`; the worker consumes the delivery queue, never the DLQ. Its five
+claimed attempts are separate from SQS receive count: active leases, early
+receipts, and infrastructure errors can consume receives. Terminal application
+failures are committed and deleted, not automatically moved to the DLQ. Messages
+the worker cannot acknowledge, such as malformed messages, can reach the DLQ.
+Operator inspection/recovery is still a later stage. Moto redrive tests do not
+establish AWS retention or IAM behavior.
+
+After applying the initial migration and
 setting a nonempty `GITHUB_WEBHOOK_SECRET_LOCAL` in `.env`, start the API and
 publisher. Source rows must reference `env:GITHUB_WEBHOOK_SECRET_LOCAL` for this
 Compose configuration. The integration tests generate their own source, rule,
@@ -411,34 +434,40 @@ HTTP and retries deletion. Terminal failures remain inspectable in `deliveries`;
 they are not automatically sent to a DLQ. A timeout or crash after Slack accepts
 a request can still produce a duplicate notification.
 
-Still remaining: DLQ configuration/recovery, SSM secret resolution, and a
-dedicated Compose worker service. `docs/architecture.md` describes the full target
+Still remaining: operator DLQ recovery and SSM secret resolution.
+`docs/architecture.md` describes the full target
 design, including these features that are not yet implemented.
 
-### Optional standalone worker invocation
+### Start the Compose worker
 
 This command sends real Slack messages when configured with a real webhook.
 It has not been executed as part of local verification. First finish the local
 database/queue/publisher setup above. The publisher must run separately to put
 delivery IDs on the queue. For a destination belonging to tenant 1, register
 `env:SLACK_WEBHOOK_URL_TENANT_1_DEMO` as its `webhook_url_ref` and set the matching
-`SLACK_WEBHOOK_URL_TENANT_1_DEMO` environment variable in your shell to the secret
-Slack URL using your normal secure secret-entry method. Use your actual tenant ID;
+`SLACK_WEBHOOK_URL_TENANT_1_DEMO` variable in your uncommitted `.env` or shell to the
+secret Slack URL using your normal secure secret-entry method. Use your actual tenant ID;
 the earlier demo placeholder `env:SLACK_WEBHOOK_URL_LOCAL` is not a valid worker
 reference. Keep the URL out of SQL, logs, committed files, and shell history.
 
-Reuse the publisher's database/SQS environment with a different command:
+The worker has its own service and waits for healthy PostgreSQL and Moto. The
+demo secret mapping is explicit and is passed only to the worker. For another
+tenant, add its corresponding `SLACK_WEBHOOK_URL_TENANT_<id>_<NAME>` mapping under
+the worker's `environment` and set that variable locally. No arbitrary `.env`
+variables are forwarded. Start the complete local set after queue setup:
 
 ```powershell
-docker compose --profile publisher run --rm --build -e SLACK_WEBHOOK_URL_TENANT_1_DEMO publisher python delivery_worker.py
+docker compose --profile publisher --profile worker up --build -d api publisher worker
+docker compose logs --tail 30 worker
+docker compose stop worker publisher
 ```
 
-The `-e` option forwards the existing shell variable without putting its value
-in the command. Compose does not automatically pass arbitrary variables from
-`.env` to this container. The existing `SQS_QUEUE_URL` must identify the queue
-created earlier, and local publishing/consumption uses `SQS_ENDPOINT_URL=http://sqs:5000`
-with dummy AWS credentials. No worker service or cloud resources are provisioned
-by this implementation.
+The `publisher` and `worker` profiles are independent; normal `docker compose up`
+starts only API/database. The separate `setup` profile is for explicit queue setup.
+The existing `SQS_QUEUE_URL` must identify the delivery queue created earlier;
+local publishing/consumption uses `SQS_ENDPOINT_URL=http://sqs:5000` with dummy AWS
+credentials. Queue setup does not edit `.env`. The worker has a 30-second shutdown
+grace period; the documented OS DNS shutdown limitation still applies.
 
 An eventual AWS worker task role needs `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
 and `sqs:ChangeMessageVisibility` scoped to its delivery queue. The publisher's
@@ -474,7 +503,15 @@ The retry tests additionally exercise backoff, early duplicate receipts, final
 claim expiry, stale failure updates, database/visibility/deletion failures,
 `Retry-After` parsing and long delays, and real Moto/HTTP retry followed by success.
 
-Verified locally on November 11, 2026: **95 tests passed in 43.70 seconds** using
+Local queue/Compose stage verified on November 11, 2026: **97 tests passed in
+47.87 seconds**. `tests/test_local_sqs_setup.py` verifies queue attributes,
+repeatable updates that preserve messages, and Moto redrive after ten receives.
+Both the test image and queue-init image built successfully. Compose validation
+passed, and the actual `queue-init` command succeeded twice with the same queue
+URLs. The local `deliveries` and `deliveries-dlq` queues remain configured in Moto;
+`.env` was not modified. No worker was started against a real Slack destination.
+
+Previous retry-stage verification on November 11, 2026: **95 tests passed in 43.70 seconds** using
 PostgreSQL and Moto, including the existing ingestion/publisher/sender suite.
 The test image build, Compose configuration validation, and whitespace checks
 passed. The real queue-to-local-HTTP retry test waited for the persisted retry
@@ -576,6 +613,8 @@ volume if you need to initialize with different settings, then start again.
 | `outbox_publisher.py` | PostgreSQL polling, SQS publication, and retries |
 | `delivery_worker.py` | SQS reception, database leases, and successful delivery completion |
 | `slack_sender.py` | Tenant-bound local secrets and restricted Slack HTTP delivery |
+| `setup_local_sqs.py` | Explicit, repeatable Moto delivery queue and DLQ configuration |
+| `tests/test_local_sqs_setup.py` | Queue settings, repeatability, message preservation, and Moto redrive tests |
 | `tests/test_outbox_publisher.py` | PostgreSQL-backed publisher behavior tests |
 | `tests/test_webhook_ingestion.py` | Routing, concurrent deduplication, rollback, tenant constraints, and payload validation tests |
 | `tests/test_delivery_worker.py` | Worker state, ordering, and local queue-to-HTTP tests |
