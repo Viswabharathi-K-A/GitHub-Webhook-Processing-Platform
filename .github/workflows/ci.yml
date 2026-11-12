@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COMPOSE_PROJECT_NAME: webhook-ci
+      POSTGRES_DB: webhook_test
+      POSTGRES_USER: webhook_test
+      POSTGRES_PASSWORD: local-ci-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Build test image
+        run: docker compose --profile test build tests
+
+      - name: Run tests with PostgreSQL and Moto
+        run: docker compose --profile test run --rm tests
+
+      - name: Clean up test containers and volumes
+        if: always()
+        run: docker compose --profile test down --volumes --remove-orphans
