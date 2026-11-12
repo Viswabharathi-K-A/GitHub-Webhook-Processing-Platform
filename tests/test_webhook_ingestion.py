@@ -24,7 +24,7 @@ def database(monkeypatch):
             connection.execute("INSERT INTO tenants (name) VALUES ('test')")
             connection.execute("""
                 INSERT INTO sources (tenant_id, name, webhook_secret_ref)
-                VALUES (1, 'test', 'env:GITHUB_WEBHOOK_SECRET_TEST')
+                VALUES (1, 'test', 'env:GITHUB_WEBHOOK_SECRET_TENANT_1_TEST')
             """)
             connection.execute("""
                 INSERT INTO destinations (tenant_id, name, webhook_url_ref)
@@ -36,18 +36,18 @@ def database(monkeypatch):
             """)
             config["options"] += f" -c search_path={schema}"
             monkeypatch.setattr(main, "database_config", lambda: config)
-            monkeypatch.setenv("GITHUB_WEBHOOK_SECRET_TEST", "test-secret")
+            monkeypatch.setenv("GITHUB_WEBHOOK_SECRET_TENANT_1_TEST", "test-secret")
             yield connection
         finally:
             connection.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
 
-async def send_webhook(client, body=b'{}', delivery_id=None):
-    return await client.post("/webhooks/github/1", content=body, headers={
+async def send_webhook(client, body=b'{}', delivery_id=None, source_id=1, secret=b"test-secret"):
+    return await client.post(f"/webhooks/github/{source_id}", content=body, headers={
         "X-GitHub-Event": "push",
         "X-GitHub-Delivery": delivery_id or str(uuid4()),
         "X-Hub-Signature-256": "sha256=" + hmac.new(
-            b"test-secret", body, hashlib.sha256
+            secret, body, hashlib.sha256
         ).hexdigest(),
         "Content-Type": "application/json",
     })
@@ -117,7 +117,7 @@ def test_rule_cannot_reference_another_tenants_resources(database, relationship)
     database.execute("INSERT INTO tenants (name) VALUES ('other')")
     database.execute("""
         INSERT INTO sources (tenant_id, name, webhook_secret_ref)
-        VALUES (2, 'other', 'env:GITHUB_WEBHOOK_SECRET_OTHER')
+        VALUES (2, 'other', 'env:GITHUB_WEBHOOK_SECRET_TENANT_2_OTHER')
     """)
     database.execute("""
         INSERT INTO destinations (tenant_id, name, webhook_url_ref)
@@ -142,3 +142,54 @@ def test_rule_cannot_reference_another_tenants_resources(database, relationship)
 def test_invalid_or_oversized_payload_leaves_no_records(database, body, status):
     assert post_webhook(body).status_code == status
     assert row_counts(database) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("reference", [
+    "env:GITHUB_WEBHOOK_SECRET_TENANT_2_TEST",
+    "env:GITHUB_WEBHOOK_SECRET_TENANT_10_TEST",
+    "env:GITHUB_WEBHOOK_SECRET_LOCAL",
+    "env:POSTGRES_PASSWORD",
+])
+def test_webhook_cannot_resolve_unscoped_or_other_tenant_secrets(database, monkeypatch, reference):
+    # Even a provisioned value with a matching signature must not bypass scope.
+    monkeypatch.setenv(reference.removeprefix("env:"), "test-secret")
+    database.execute("UPDATE sources SET webhook_secret_ref = %s", (reference,))
+    assert post_webhook().status_code == 503
+    assert row_counts(database) == (0, 0, 0)
+
+
+def test_two_tenants_use_separate_secrets_and_keep_events_and_routing_isolated(database, monkeypatch):
+    database.execute("INSERT INTO tenants (name) VALUES ('other')")
+    database.execute("""
+        INSERT INTO sources (tenant_id, name, webhook_secret_ref)
+        VALUES (2, 'other', 'env:GITHUB_WEBHOOK_SECRET_TENANT_2_TEST')
+    """)
+    database.execute("""
+        INSERT INTO destinations (tenant_id, name, webhook_url_ref)
+        VALUES (2, 'other', 'env:SLACK_WEBHOOK_URL_TENANT_2_TEST')
+    """)
+    database.execute("""
+        INSERT INTO rules (tenant_id, source_id, destination_id, event_type)
+        VALUES (2, 2, 2, 'push')
+    """)
+    monkeypatch.setenv("GITHUB_WEBHOOK_SECRET_TENANT_2_TEST", "other-secret")
+
+    async def send():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=main.app), base_url="http://test"
+        ) as client:
+            # Tenant 1's signature must not authenticate tenant 2's source.
+            assert (await send_webhook(client, source_id=2)).status_code == 401
+            assert row_counts(database) == (0, 0, 0)
+            delivery_id = str(uuid4())
+            # Payload tenant IDs are untrusted; the registered source owns the event.
+            assert (await send_webhook(client, body=b'{"tenant_id":2}', delivery_id=delivery_id)).status_code == 202
+            assert (await send_webhook(
+                client, body=b'{"tenant_id":1}', delivery_id=delivery_id,
+                source_id=2, secret=b"other-secret",
+            )).status_code == 202
+
+    asyncio.run(send())
+    assert database.execute("SELECT tenant_id, source_id FROM events ORDER BY tenant_id").fetchall() == [(1, 1), (2, 2)]
+    assert database.execute("SELECT tenant_id, source_id, destination_id FROM deliveries ORDER BY tenant_id").fetchall() == [(1, 1, 1), (2, 2, 2)]
+    assert database.execute("SELECT tenant_id FROM outbox ORDER BY tenant_id").fetchall() == [(1,), (2,)]

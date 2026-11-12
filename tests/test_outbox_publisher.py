@@ -45,7 +45,7 @@ def database():
             connection.execute("INSERT INTO tenants (name) VALUES ('test')")
             connection.execute("""
                 INSERT INTO sources (tenant_id, name, webhook_secret_ref)
-                VALUES (1, 'test', 'env:GITHUB_WEBHOOK_SECRET_TEST')
+                VALUES (1, 'test', 'env:GITHUB_WEBHOOK_SECRET_TENANT_1_TEST')
             """)
             connection.execute("""
                 INSERT INTO destinations (tenant_id, name, webhook_url_ref)
@@ -155,7 +155,7 @@ def running_process(module, schema, endpoint, queue_url, port=0):
         AWS_DEFAULT_REGION="us-west-2", AWS_ACCESS_KEY_ID="test",
         AWS_SECRET_ACCESS_KEY="test", AWS_SESSION_TOKEN="",
         AWS_EC2_METADATA_DISABLED="true", SQS_ENDPOINT_URL=endpoint,
-        SQS_QUEUE_URL=queue_url, GITHUB_WEBHOOK_SECRET_LOCAL="integration-secret",
+        SQS_QUEUE_URL=queue_url, GITHUB_WEBHOOK_SECRET_TENANT_1_LOCAL="integration-secret",
     )
     # Only the child process uses this schema; production configuration is unchanged.
     code = (
@@ -200,7 +200,7 @@ def test_signed_http_webhook_to_real_sqs_and_duplicate(database, local_sqs):
     connection.execute("DELETE FROM outbox")
     connection.execute("DELETE FROM deliveries")
     connection.execute("DELETE FROM events")
-    connection.execute("UPDATE sources SET webhook_secret_ref = 'env:GITHUB_WEBHOOK_SECRET_LOCAL'")
+    connection.execute("UPDATE sources SET webhook_secret_ref = 'env:GITHUB_WEBHOOK_SECRET_TENANT_1_LOCAL'")
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]

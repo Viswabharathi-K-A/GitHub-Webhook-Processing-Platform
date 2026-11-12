@@ -36,14 +36,14 @@ This is a **logical** diagram, not a complete networking diagram. Keep one codeb
 - Security groups allow only necessary communication (ALB to API; API/worker to RDS).
 - Do not add NAT Gateways or a collection of paid interface endpoints by default. Private application subnets with NAT remain a documented upgrade when private task addressing is required; Slack still needs internet egress. Public IPv4 addresses also incur charges, so compare the actual deployment estimate before provisioning.
 - IAM task roles grant only required permissions; ECS execution role covers image pulls, logging, and injected secrets.
-- HTTPS is required before sending real credentials or authenticated management requests over the public internet. A suitable domain/certificate strategy must be selected before deployment.
+- HTTPS is required for the public webhook endpoint. Database credentials remain restricted to trusted application/operator access. A suitable domain/certificate strategy must be selected before deployment.
 
 ## 3. Technology stack
 
 | Area | Technology | Purpose |
 |---|---|---|
 | Language | Python 3.13 | Backend and worker code |
-| HTTP API | FastAPI + Uvicorn | Webhook ingestion and management endpoints |
+| HTTP API | FastAPI + Uvicorn | Signed webhook ingestion and health endpoints |
 | Database | PostgreSQL 16 | Durable events, configuration, and delivery state |
 | Database access | psycopg 3 | Explicit SQL and transactions; add a small pool only if measured connection overhead warrants it |
 | Migrations | Versioned SQL files | Controlled schema evolution |
@@ -75,18 +75,17 @@ Endpoint: `POST /webhooks/github/{source_id}`.
 - Evaluate the source's routing rules.
 - In one PostgreSQL transaction, insert the event and any pending delivery rows.
 - Return promptly without waiting for Slack delivery.
-- Expose separate authenticated management endpoints for tenants, sources, Slack destinations, and rules.
+- Keep configuration operator-managed through explicit SQL transactions.
 
-Tenant creation and initial key issuance are operator bootstrap actions, not an unauthenticated signup API. Tenant callers manage only their own configuration. Public webhook authentication remains GitHub HMAC verification; management API keys are not required on GitHub webhook requests.
+The operator creates tenants, sources, Slack destinations, and rules using trusted database access. There is no public signup or configuration API, API-key lifecycle, or administrative CLI. Public webhook requests are authenticated with GitHub HMAC verification. The registered source determines tenant identity.
 
 ### PostgreSQL
 
-Current tables and deferred authentication work:
+Current tables (migration `001_initial_schema.sql`):
 
 | Table | Responsibility |
 |---|---|
 | `tenants` | Tenant records |
-| `api_keys` (deferred) | Planned hashed management API keys and tenant association |
 | `sources` | Registered GitHub webhook sources and securely stored secrets |
 | `destinations` | Tenant-owned Slack destination configuration |
 | `rules` | Event-to-destination routing rules |
@@ -196,21 +195,21 @@ Saving an event and sending to SQS cannot be one PostgreSQL transaction. Therefo
 
 ### Multi-tenancy
 
-Every management operation must authenticate and enforce the tenant boundary. Database queries and relationships must prevent one tenant from accessing another tenant's sources, rules, events, or destinations. Include cross-tenant tests.
+Configuration is managed by a trusted operator using database credentials and explicit SQL transactions. Operator updates include tenant ID and record ID. No management HTTP endpoints are exposed, so a separate API-key system does not add value to the current portfolio scope.
 
-Use a high-entropy random API key sent in an HTTPS authorization header. Store only a SHA-256 digest and tenant association; return the raw key once at issuance. Hashing is appropriate for randomly generated keys, not human passwords. Compare digests in constant time. Support revocation and simple replacement/rotation without OAuth, Cognito, user accounts, sessions, or role hierarchies.
+Authenticate incoming webhooks using each source's separate secret and raw-body HMAC-SHA256 with constant-time comparison. Resolve GitHub and Slack secrets only within the source/delivery tenant's environment-reference namespace. Keep secret values out of SQL, logs, and responses. No API-key table, key rotation workflow, RBAC, or user-management system is needed.
 
-Derive tenant identity from the authenticated key, never a client-supplied tenant ID. Every management read/write includes that tenant scope; composite foreign keys protect relationships, not reads. Return a consistent not-found response for inaccessible resources. Use a minimal `api_keys` table with revocation metadata when implemented. Row-level security is optional defense in depth later, not a substitute for scoped SQL and isolation tests. Global delivery IDs in SQS are internal lookup identifiers, not authorization credentials.
+Derive tenant identity from the registered source, never a tenant ID in the webhook payload. Scope routing queries by tenant and retain composite foreign keys to prevent cross-tenant relationships; foreign keys alone do not provide read isolation. Tests verify secret isolation, cross-tenant link rejection, and tenant-owned event/delivery creation. Global delivery IDs in SQS are internal lookup identifiers, not authorization credentials. Any future public configuration API would require its own authentication and tenant authorization, but it is outside this project's scope.
 
 ### Security
 
 - Verify GitHub HMAC signatures using raw bytes.
-- Protect management APIs with high-entropy API keys, stored as hashes.
+- Restrict configuration changes to trusted database/operator access; do not expose unauthenticated configuration endpoints.
 - Protect source secrets and Slack webhook URLs; do not expose them in logs or API responses.
 - Slack-only destinations reduce arbitrary-URL SSRF risk. Restrict outbound destinations to the expected Slack webhook hosts, disable redirects, and validate outbound connections carefully.
 - Use HTTPS for real deployments, least-privilege IAM, private RDS, and restricted security groups.
 
-Use existing environment references for local development. For AWS, use SSM SecureString parameters and normal SDK credential resolution via task roles. Initially provision secret values through an operator procedure; management endpoints register only references within a server-controlled tenant namespace. Do not accept arbitrary environment/parameter references or expose raw secret values in responses. Provision secret values outside Terraform so they do not enter Terraform state; state still needs protected storage and restricted access. Avoid automatic rotation workflows and secret caching until needed.
+Use tenant-scoped environment references for local development: `env:GITHUB_WEBHOOK_SECRET_TENANT_<id>_<NAME>` and `env:SLACK_WEBHOOK_URL_TENANT_<id>_<NAME>`. Compose maps the existing host GitHub secret to tenant 1's scoped container variable; README documents the explicit legacy-source reference update. For AWS, plan SSM SecureString parameters and normal SDK credential resolution via task roles. The operator provisions values separately and registers scoped references with SQL. Do not resolve arbitrary environment/parameter references or expose raw values. Provision secrets outside Terraform so they do not enter state; state still needs protected storage/access. SSM support remains future work. Avoid automatic rotation workflows and secret caching.
 
 For the Slack-only MVP, allow only HTTPS, exact `hooks.slack.com`, port 443, and the expected `/services/...` path; reject userinfo, query/fragment, unexpected ports, redirects, and alternate hosts. Revalidate at send time. Use a connection strategy that rejects non-public resolved addresses and prevents DNS rebinding between validation and connection while preserving TLS hostname verification. Do not treat a separate DNS preflight followed by an unrestricted HTTP lookup as sufficient. Pick and test the smallest correct transport approach before implementing the sender; do not build a general URL-fetching service. Never log full Slack URLs or include them in exception details. Use a local fake Slack HTTP server only through test-specific wiring, without weakening production validation.
 
@@ -220,7 +219,7 @@ Use an ECS worker rather than Lambda for the initial implementation. This allows
 
 ### Local-first development
 
-Build and test locally before AWS deployment. Docker Compose now provides Moto's standalone SQS emulator on the internal network at `http://sqs:5000`, with no host port or AWS account required. Tests use real boto3 HTTP calls with dummy credentials, unique queues, isolated PostgreSQL schemas, and actual API/publisher subprocesses. This validates the local protocol and recovery paths, not AWS IAM, network behavior, durability, or production performance. The delivery worker remains unimplemented.
+Build and test locally before AWS deployment. Docker Compose provides Moto's standalone SQS emulator on the internal network at `http://sqs:5000`, with no host port or AWS account required. Tests use real boto3 HTTP calls with dummy credentials, unique queues, isolated PostgreSQL schemas, and actual API/publisher subprocesses. Slack delivery with leases/retries and a manual local DLQ procedure are implemented. This validates local behavior, not AWS IAM, network behavior, durability, or production performance.
 
 ### One-time AWS deployment
 
@@ -232,7 +231,7 @@ Keep one Terraform root with plainly named files such as `network.tf`, `database
 
 ### Lightweight CI and operations (planned)
 
-Add one GitHub Actions workflow that builds the development image, runs the existing PostgreSQL/Moto tests, and checks Terraform formatting/validation once Terraform exists. Require meaningful behavior tests, not an arbitrary coverage target. No Docker socket inside application containers, elaborate mocks, or separate test database technology. CI starts early in Stage 3; it is not postponed until deployment.
+The existing GitHub Actions workflow builds the development image, runs PostgreSQL/Moto tests, and cleans up. Add Terraform formatting/validation once Terraform exists. Require meaningful behavior tests, not an arbitrary coverage target. No Docker socket inside application containers, elaborate mocks, or separate test database technology.
 
 Start deployment as documented, operator-triggered commands with an approval boundary for Terraform apply and database migrations. If CI later performs AWS deployment, use GitHub OIDC and a narrowly scoped role with environment approval; do not store long-lived AWS keys. No multi-environment promotion system, automatic production migration, or blue/green pipeline is needed for this demo.
 
@@ -242,7 +241,7 @@ Use standard Python logs with stable fields (event, delivery/outbox ID, attempt,
 
 | Unnecessary starting complexity | Simpler decision and tradeoff |
 |---|---|
-| OAuth/Cognito and account/role framework | Tenant API keys with issuance, revocation, and scoped SQL |
+| Public management API, API-key lifecycle, OAuth/Cognito and account/role framework | Operator-run SQL configuration, GitHub HMAC authentication, and tenant-scoped queries/relationships |
 | FIFO queue or exactly-once claims | Standard SQS plus PostgreSQL idempotency/leases; Slack duplicates remain possible |
 | Retry service, periodic reconciler, heartbeat framework | SQS visibility plus DB retry state; bounded work and explicit operator recovery |
 | Separate deployable service for every loop | API and one background ECS service with two essential containers; coupled restarts are acceptable |
@@ -253,19 +252,19 @@ Use standard Python logs with stable fields (event, delivery/outbox ID, attempt,
 
 ## 7. Development roadmap
 
-Completed baseline: local foundation, signed ingestion with atomic event/delivery/outbox writes, and the polling outbox publisher. The last recorded local run passed eight PostgreSQL/Moto tests on November 10, 2026. These results validate the current publisher milestone, not the planned worker or security features below. Stages 2 to 6 replace the earlier broader roadmap numbering.
+Implemented locally: signed ingestion with atomic event/delivery/outbox writes, the polling publisher, Slack delivery with leases/retries, manual local DLQ recovery, and CI. Tenant security uses operator-managed SQL configuration, scoped secret resolution, and database/query isolation. The roadmap deliberately omits self-service management and API-key administration to keep the portfolio understandable. AWS deployment and operational verification remain future work.
 
 | Stage | Small implementation steps, in order | Completion evidence |
 |---|---|---|
 | **2 - SQS delivery worker** | 1. Agree state transitions, claim SQL, lease/timing and deletion rules. 2. Receive one message and implement terminal/active-lease/expired-lease handling. 3. Add tenant-bound secret resolution and safe Slack destination validation before any real outbound send. 4. Implement one successful bounded Slack attempt with token-guarded completion. 5. Add failure classification, DB-backed retry state/SQS visibility, DLQ configuration, and an operator recovery command/runbook. | Local signed webhook reaches a test Slack receiver through PostgreSQL and SQS. Tests cover duplicates, competing claims, stale tokens, crash/lease expiry, transient/permanent failures, retry exhaustion, deletion failure, and DLQ recovery. No exactly-once claim. |
-| **3 - Tenant management and security** | 1. Add a versioned migration for minimal hashed API keys and revocation. 2. Add operator tenant/key bootstrap and replacement procedure. 3. Add only needed tenant-scoped source/destination/rule management endpoints. 4. Enforce secret-reference namespaces, protect error/log output, and test cross-tenant reads and writes. 5. Add a simple CI test workflow. | Tenant A cannot access or link tenant B's resources; revoked/missing keys fail. Ingestion security, transaction rollback, routing and payload-limit tests pass. Secrets and raw keys are absent from stored API-key data, responses and logs. No unauthenticated tenant signup. |
+| **3 - Minimal tenant security** | 1. Keep operator-run transactional SQL configuration. 2. Scope GitHub/Slack secret references by tenant. 3. Preserve tenant-scoped routing and composite foreign keys. 4. Verify signatures, cross-tenant link rejection, and tenant-owned event/delivery creation. 5. Run the existing CI tests. | A source's secret cannot authenticate another tenant's webhook; tenant-owned events/deliveries remain isolated; cross-tenant references fail. Core pipeline tests pass. No public management API or new authentication schema/module is needed. |
 | **4 - Temporary AWS deployment** | 1. Estimate costs and document the demo topology/tradeoffs. 2. Write a single Terraform root and protected-state bootstrap instructions. 3. Provision minimum VPC, security groups, ECR, RDS, SQS/DLQ, IAM, SSM references, ALB/HTTPS and ECS resources. 4. Push one image, provision secrets outside Terraform, apply reviewed migrations, and start API/background tasks. 5. Verify an authorized real GitHub-to-Slack demonstration. | Terraform fmt/validate and reviewed plan; authenticated HTTPS and a working cloud pipeline in us-west-2. Least-privilege roles, private RDS, known billable resources and teardown instructions. Production availability limits are explicit. |
 | **5 - Operational verification** | 1. Finalize useful CloudWatch logs, short retention, and a few alarms. 2. Exercise DB/queue/Slack outages, process death, expired leases and DLQ recovery. 3. Run a small bounded load test and record backlog, throughput, latency and resource limits. 4. Finalize deployment/recovery procedures; add OIDC/manual approval only if CI deployment is actually needed. | Recorded recovery evidence, actionable alarms and reproducible commands. No unsupported availability, throughput, or exactly-once guarantees. No new observability service or automated recovery framework. |
 | **6 - Portfolio and cleanup** | 1. Record a concise real demo. 2. Finish architecture, setup, security, design tradeoffs and test-results documentation. 3. Destroy cloud resources after evidence collection. 4. Inspect remaining databases/snapshots, ALBs, tasks, IPv4 allocations, images, log groups and state-backend resources; retain only explicitly chosen artifacts. | Interview-ready repository and evidence explaining transactions, leases, at-least-once attempts, tenant isolation and AWS deployment. No intentionally running billable application infrastructure; any retained storage/cost is identified. |
 
-Security, focused tests, logging, and documentation accompany each implementation step. Stage 3 completes management security; it does not defer safe secret handling or destination validation from Stage 2. Stage 5 verifies operations rather than introducing monitoring for the first time. Stages 4 to 6 should run in a short cloud demonstration window, not weeks of idle infrastructure.
+Security, focused tests, logging, and documentation accompany each implementation step. Stage 3 verifies tenant boundaries without a management subsystem. Stage 5 verifies operations rather than introducing monitoring for the first time. Stages 4 to 6 should run in a short cloud demonstration window, not weeks of idle infrastructure.
 
-**Next implementation task:** review the Stage 2 state/lease contract and choose the smallest safe Slack HTTP transport, then implement one successful delivery with focused tests. Documentation decisions here are proposed implementation requirements; they do not mean those features already exist.
+**Next implementation task:** review the temporary AWS topology, costs, state/secret bootstrap, explicit migration procedure, and HTTPS prerequisites before proposing Terraform changes. The legacy local GitHub reference update is documented in README and remains an explicit operator action. AWS infrastructure and SSM secret resolution are not yet implemented.
 
 **Development rule:** implement small, reviewable batches authorized by the developer; test and explain each batch before expanding scope.
 

@@ -15,15 +15,16 @@ distinguish implemented behavior from planned work:
 | Stage | Goal |
 |---|---|
 | 2 — Delivery worker | Slack-only delivery with PostgreSQL idempotency/leases, bounded retries, SQS visibility and practical DLQ recovery |
-| 3 — Tenant management | Hashed API keys, tenant-scoped configuration, protected secret references, isolation tests and simple CI |
+| 3 — Tenant isolation | Operator-managed SQL configuration, tenant-scoped secret references, isolation tests and simple CI |
 | 4 — Temporary AWS deployment | One readable Terraform root, minimal ECS/RDS/SQS/ALB infrastructure, scoped IAM and HTTPS in us-west-2 |
 | 5 — Operational verification | Useful logs/alarms, failure and recovery checks, bounded load measurements and lightweight deployment procedures |
 | 6 — Portfolio and cleanup | Record real evidence, document tradeoffs, destroy and inspect billable resources |
 
 Security and tests are part of every stage. Delivery attempts are at least once;
 Slack notifications can duplicate after uncertain outcomes. The project does
-not promise exactly-once delivery. Use tenant API keys rather than OAuth/Cognito,
-and keep explicit SQL and the existing codebase instead of adding frameworks.
+not promise exactly-once delivery. Configuration is managed by the operator
+through SQL; there is no public management API or separate API-key system.
+Keep explicit SQL and the existing codebase instead of adding frameworks.
 The AWS plan is a temporary demonstration with documented availability and
 networking tradeoffs, not a continuously running production service.
 
@@ -163,14 +164,64 @@ inserts the event, deliveries, and outbox rows in one transaction. Publication
 and notification status are independent. The publisher uses
 transactional row locking; worker lease tokens will identify individual claims so
 stale workers cannot overwrite a newer claim. The publisher and delivery worker
-include failure handling and retries. Management API key storage is deferred to
-the authentication step.
+include failure handling and retries. Tenant/source/destination/rule configuration
+uses explicit operator-run SQL, as shown in the local demonstration below.
 
 Secret reference columns must identify recoverable values in a secure secret
 store; they must not contain raw GitHub secrets or Slack webhook URLs. The secret
 store implementation is deferred. Error fields should contain only sanitized
 messages, never secrets or sensitive payloads. Applications must still authenticate
-requests and scope queries by tenant; foreign keys do not provide read isolation.
+webhooks and scope queries by tenant; foreign keys do not provide read isolation.
+
+## Minimal tenant security
+
+This portfolio project has no self-service management endpoints, API-key table,
+or administrative CLI. A trusted operator creates and updates configuration using
+database credentials and explicit SQL transactions. Use the existing demo SQL
+below; substitute the actual tenant/source/destination IDs when changing records.
+Disable records with tenant-scoped updates rather than deleting delivery history:
+
+```sql
+UPDATE rules SET enabled = false WHERE tenant_id = YOUR_TENANT_ID AND id = YOUR_RULE_ID;
+```
+
+Public GitHub requests are authenticated using raw-body HMAC-SHA256 verification.
+The API derives tenant identity from the registered source, not the request
+payload. Composite foreign keys prevent cross-tenant links; routing queries also
+include tenant ownership. Use a separate secret value for each tenant's source.
+Existing tests cover cross-tenant constraints, signatures, and routing isolation.
+
+Secret references are restricted at resolution time to:
+
+```text
+env:GITHUB_WEBHOOK_SECRET_TENANT_<tenant_id>_<NAME>
+env:SLACK_WEBHOOK_URL_TENANT_<tenant_id>_<NAME>
+```
+
+`<NAME>` contains uppercase letters, digits, and underscores. The host `.env`
+variable `GITHUB_WEBHOOK_SECRET_LOCAL` stays unchanged: Compose passes it to the
+API as `GITHUB_WEBHOOK_SECRET_TENANT_1_LOCAL`. Slack's existing tenant-1 demo
+mapping is unchanged. Provision distinct values and explicit container environment
+mappings for other tenants; database reference columns contain no raw secrets.
+
+Existing sources using the old unscoped GitHub reference need a one-time operator
+update before starting the new API image. For the existing tenant-1 demo, run this
+in `psql` (no schema migration is needed):
+
+```sql
+BEGIN;
+UPDATE sources
+SET webhook_secret_ref = 'env:GITHUB_WEBHOOK_SECRET_TENANT_1_LOCAL'
+WHERE tenant_id = 1 AND webhook_secret_ref = 'env:GITHUB_WEBHOOK_SECRET_LOCAL'
+RETURNING id, tenant_id, webhook_secret_ref;
+COMMIT;
+```
+
+This update is not automatic and does not change the secret value or GitHub's
+configured secret. Coordinate the reference update and API recreation because
+the old API image expects the old name. Other legacy references require their
+own tenant-specific mapping/update. Migration `001` remains the only migration;
+there is no migration `002` to apply.
 
 ## Outbox publisher
 
@@ -244,8 +295,9 @@ Moto redrive tests do not establish AWS retention or IAM behavior.
 
 After applying the initial migration and
 setting a nonempty `GITHUB_WEBHOOK_SECRET_LOCAL` in `.env`, start the API and
-publisher. Source rows must reference `env:GITHUB_WEBHOOK_SECRET_LOCAL` for this
-Compose configuration. The integration tests generate their own source, rule,
+publisher. Tenant-1 source rows must reference
+`env:GITHUB_WEBHOOK_SECRET_TENANT_1_LOCAL` for this Compose configuration.
+The integration tests generate their own source, rule,
 secret, and signed request without modifying your `.env` or public schema.
 
 ```powershell
@@ -273,7 +325,7 @@ not assume an empty database or IDs starting at one:
 BEGIN;
 INSERT INTO tenants (name) VALUES ('local-demo') RETURNING id AS demo_tenant_id \gset
 INSERT INTO sources (tenant_id, name, webhook_secret_ref)
-VALUES (:demo_tenant_id, 'local-github', 'env:GITHUB_WEBHOOK_SECRET_LOCAL')
+VALUES (:demo_tenant_id, 'local-github', 'env:GITHUB_WEBHOOK_SECRET_TENANT_' || :demo_tenant_id || '_LOCAL')
 RETURNING id AS demo_source_id \gset
 INSERT INTO destinations (tenant_id, name, webhook_url_ref)
 VALUES (:demo_tenant_id, 'local-placeholder', 'env:SLACK_WEBHOOK_URL_LOCAL')
@@ -281,16 +333,20 @@ RETURNING id AS demo_destination_id \gset
 INSERT INTO rules (tenant_id, source_id, destination_id, event_type)
 VALUES (:demo_tenant_id, :demo_source_id, :demo_destination_id, 'push');
 COMMIT;
+\echo Demo tenant ID: :demo_tenant_id
 \echo Demo source ID: :demo_source_id
 \q
 ```
 
-Copy the printed source ID into the prompt below. The Python code runs inside
+Copy the printed tenant and source IDs into the prompts below. Compose maps
+only tenant 1 by default; provision the matching API environment variable first
+if this example created a different tenant ID. The Python code runs inside
 the API container, reads its configured secret without printing it, and signs
 the exact bytes sent over HTTP. It submits the same delivery twice:
 
 ```powershell
 $demoSourceId = Read-Host 'Demo source ID'
+$demoTenantId = Read-Host 'Demo tenant ID'
 @'
 import hashlib
 import hmac
@@ -301,7 +357,7 @@ from uuid import uuid4
 
 source_id = int(sys.argv[1])
 body = b'{"ref":"refs/heads/main","repository":{"name":"local-demo"}}'
-secret = os.environ['GITHUB_WEBHOOK_SECRET_LOCAL'].encode()
+secret = os.environ[f'GITHUB_WEBHOOK_SECRET_TENANT_{int(sys.argv[2])}_LOCAL'].encode()
 headers = {
     'Content-Type': 'application/json',
     'X-GitHub-Event': 'push',
@@ -314,7 +370,7 @@ for _ in range(2):
     )
     with urllib.request.urlopen(request, timeout=10) as response:
         print(response.status, response.read().decode())
-'@ | docker compose exec -T api python - $demoSourceId
+'@ | docker compose exec -T api python - $demoSourceId $demoTenantId
 ```
 
 Expect `202 {"status":"accepted"}` followed by `200 {"status":"duplicate"}`.

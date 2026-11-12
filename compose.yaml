@@ -9,7 +9,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
       POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      GITHUB_WEBHOOK_SECRET_LOCAL: ${GITHUB_WEBHOOK_SECRET_LOCAL:-}
+      # Keep the host .env variable; expose it under tenant 1's scoped name.
+      GITHUB_WEBHOOK_SECRET_TENANT_1_LOCAL: ${GITHUB_WEBHOOK_SECRET_LOCAL:-}
     depends_on:
       db:
         condition: service_healthy

@@ -27,8 +27,11 @@ def database_config():
     }
 
 
-def resolve_webhook_secret(reference):
-    if not re.fullmatch(r"env:GITHUB_WEBHOOK_SECRET_[A-Z0-9_]+", reference):
+def resolve_webhook_secret(tenant_id, reference):
+    prefix = f"env:GITHUB_WEBHOOK_SECRET_TENANT_{tenant_id}_"
+    if not isinstance(reference, str) or not re.fullmatch(
+        re.escape(prefix) + r"[A-Z0-9_]+", reference
+    ):
         raise HTTPException(status_code=503, detail="Webhook secret unavailable")
     secret = os.environ.get(reference.removeprefix("env:"))
     if not secret:
@@ -114,7 +117,7 @@ async def github_webhook(
                     if source is None:
                         raise HTTPException(status_code=404, detail="Source not found")
                     tenant_id, secret_reference = source
-                    secret = resolve_webhook_secret(secret_reference)
+                    secret = resolve_webhook_secret(tenant_id, secret_reference)
                     expected = hmac.new(secret, body, hashlib.sha256).hexdigest()
                     if not hmac.compare_digest(expected, signature[7:].lower()):
                         raise HTTPException(status_code=401, detail="Invalid signature")
