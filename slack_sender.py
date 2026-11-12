@@ -15,6 +15,11 @@ HTTP_TIMEOUT_SECONDS = 10
 class SlackSendError(Exception):
     """Contains only a sanitized category, never a URL or response body."""
 
+    def __init__(self, reason, *, retryable=False, retry_after=None):
+        super().__init__(reason)
+        self.retryable = retryable
+        self.retry_after = retry_after
+
 
 def resolve_slack_url(tenant_id, reference):
     prefix = f"env:SLACK_WEBHOOK_URL_TENANT_{tenant_id}_"
@@ -49,7 +54,7 @@ class PublicSlackResolver(AbstractResolver):
             raise SlackSendError("invalid_destination")
         addresses = await self.resolver.resolve(host, port, family=socket.AF_INET)
         if not addresses:
-            raise SlackSendError("dns_unavailable")
+            raise SlackSendError("dns_unavailable", retryable=True)
         for address in addresses:
             ip = ipaddress.ip_address(address["host"])
             if ip.version != 4 or not ip.is_global or ip.is_multicast:
@@ -80,7 +85,18 @@ async def send_slack(tenant_id, reference, text):
                 allow_redirects=False,
             ) as response:
                 if response.status != 200:
-                    raise SlackSendError(f"http_{response.status}")
+                    retryable = response.status in (408, 429) or 500 <= response.status < 600
+                    retry_after = None
+                    header = response.headers.get("Retry-After", "").strip()
+                    # Slack specifies whole seconds. Ignore malformed values;
+                    # reject unrepresentable delays rather than retrying early.
+                    if retryable and re.fullmatch(r"[0-9]+", header):
+                        digits = header.lstrip("0") or "0"
+                        if len(digits) > 10 or int(digits) > 2147483647:
+                            raise SlackSendError("retry_after_out_of_range")
+                        retry_after = int(digits)
+                    raise SlackSendError(f"http_{response.status}",
+                                         retryable=retryable, retry_after=retry_after)
                 # Slack returns 'ok'. Read at most four bytes, including EOF for
                 # the expected short body, under the same total request timeout.
                 try:
@@ -90,8 +106,10 @@ async def send_slack(tenant_id, reference, text):
                 if body not in (b"ok", b"ok\n"):
                     raise SlackSendError("unexpected_response")
     except TimeoutError:
-        raise SlackSendError("http_timeout") from None
+        raise SlackSendError("http_timeout", retryable=True) from None
+    except (aiohttp.ClientConnectorCertificateError, aiohttp.ClientConnectorSSLError):
+        raise SlackSendError("tls_validation_failed") from None
     except (aiohttp.ClientError, OSError, ValueError):
-        raise SlackSendError("http_transport_error") from None
+        raise SlackSendError("http_transport_error", retryable=True) from None
     finally:
         await resolver.close()

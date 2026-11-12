@@ -19,6 +19,8 @@ from slack_sender import SlackSendError, send_slack
 logger = logging.getLogger(__name__)
 LEASE_SECONDS = 60
 VISIBILITY_SECONDS = 90
+MAX_ATTEMPTS = 5
+MAX_VISIBILITY_SECONDS = 3600
 
 
 def database_config():
@@ -56,8 +58,18 @@ def claim_delivery(connection, delivery_id):
             due = (job["lease_expires_at"] if job["status"] == "processing"
                    else job["next_attempt_at"])
             if due is not None and due > now:
-                delay = min(43200, max(1, math.ceil((due - now).total_seconds())))
+                delay = min(MAX_VISIBILITY_SECONDS, max(1, math.ceil((due - now).total_seconds())))
                 return "deferred", job, delay
+
+            # Active claims were deferred above, even on their final attempt.
+            # An expired final claim may have sent before crashing: never send a sixth time.
+            if job["attempt_count"] >= MAX_ATTEMPTS:
+                cursor.execute("""
+                    UPDATE deliveries SET status = 'failed', completed_at = clock_timestamp(),
+                        lease_token = NULL, lease_expires_at = NULL, last_error = 'attempts_exhausted'
+                    WHERE id = %s
+                """, (delivery_id,))
+                return "terminal", job, 0
 
             token = uuid4()
             cursor.execute("""
@@ -69,18 +81,18 @@ def claim_delivery(connection, delivery_id):
                 WHERE id = %s
             """, (token, LEASE_SECONDS, delivery_id))
             job["lease_token"] = token
+            job["attempt_count"] += 1
     return "claimed", job, 0
 
 
 def load_destination(connection, job):
     # Recheck the lease and enabled destination immediately before the send.
     return connection.execute("""
-        SELECT dest.webhook_url_ref
+        SELECT dest.webhook_url_ref, dest.enabled
         FROM deliveries d
         JOIN destinations dest ON dest.tenant_id = d.tenant_id AND dest.id = d.destination_id
         WHERE d.id = %s AND d.tenant_id = %s AND d.lease_token = %s
           AND d.status = 'processing' AND d.lease_expires_at > clock_timestamp()
-          AND dest.enabled = true
     """, (job["id"], job["tenant_id"], job["lease_token"])).fetchone()
 
 
@@ -99,6 +111,26 @@ def complete_delivery(connection, job):
         """, (job["id"], job["tenant_id"], job["lease_token"])).fetchone()
     return result is not None
 
+
+def record_failure(connection, job, error):
+    retry = error.retryable and job["attempt_count"] < MAX_ATTEMPTS
+    delay = max(5 * 2 ** (job["attempt_count"] - 1), error.retry_after or 0) if retry else 0
+    status = "pending" if retry else "failed"
+    with connection.transaction():
+        connection.execute("SELECT id FROM deliveries WHERE id = %s FOR UPDATE", (job["id"],))
+        result = connection.execute("""
+            UPDATE deliveries
+            SET status = %s, last_error = %s, lease_token = NULL, lease_expires_at = NULL,
+                next_attempt_at = clock_timestamp() + %s * interval '1 second',
+                completed_at = CASE WHEN %s = 'failed' THEN clock_timestamp() ELSE NULL END
+            WHERE id = %s AND tenant_id = %s AND lease_token = %s
+              AND status = 'processing' AND lease_expires_at > clock_timestamp()
+            RETURNING id
+        """, (status, str(error), delay, status, job["id"], job["tenant_id"],
+              job["lease_token"])).fetchone()
+    if result is None:
+        return "lease_lost", 0
+    return status, min(delay, MAX_VISIBILITY_SECONDS)
 
 
 async def process_message(connection, sqs, queue_url, message):
@@ -125,29 +157,31 @@ async def process_message(connection, sqs, queue_url, message):
         try:
             destination = load_destination(connection, job)
             if destination is None:
-                raise SlackSendError("destination_disabled_or_lease_lost")
+                logger.warning("delivery_id=%s outcome=lease_lost", delivery_id)
+                return
+            if not destination[1]:
+                raise SlackSendError("destination_disabled")
             text = (f"GitHub {job['event_type']} event received. "
                     f"Event {job['event_id']}, delivery {delivery_id}.")
             await send_slack(job["tenant_id"], destination[0], text)
         except SlackSendError as error:
-            # Step 1/2 deliberately stops on send failure. Preserve the claim
-            # and message for inspection; a later restart can reclaim after expiry.
-            try:
-                connection.execute("""
-                    UPDATE deliveries SET last_error = %s
-                    WHERE id = %s AND tenant_id = %s AND lease_token = %s
-                      AND status = 'processing' AND lease_expires_at > clock_timestamp()
-                """, (str(error), delivery_id, job["tenant_id"], job["lease_token"]))
-            except psycopg.Error as database_error:
-                logger.warning("delivery_id=%s outcome=error_record_failed error_type=%s",
-                               delivery_id, type(database_error).__name__)
-            # Failure to record the reason must not turn a send failure into an
-            # automatic infrastructure retry in this success-path-only stage.
-            raise
-        if not complete_delivery(connection, job):
-            logger.warning("delivery_id=%s outcome=lease_lost", delivery_id)
-            return
-        logger.info("delivery_id=%s outcome=succeeded", delivery_id)
+            outcome, delay = record_failure(connection, job, error)
+            logger.info("delivery_id=%s attempt=%s outcome=%s reason=%s",
+                        delivery_id, job["attempt_count"], outcome, error)
+            if outcome == "lease_lost":
+                return
+            if outcome == "pending":
+                # The database commit comes first. If this fails, the next receipt
+                # consults next_attempt_at and cannot send early.
+                sqs.change_message_visibility(
+                    QueueUrl=queue_url, ReceiptHandle=receipt, VisibilityTimeout=delay,
+                )
+                return
+        else:
+            if not complete_delivery(connection, job):
+                logger.warning("delivery_id=%s outcome=lease_lost", delivery_id)
+                return
+            logger.info("delivery_id=%s outcome=succeeded", delivery_id)
 
     # Both paths reach here only after a durable terminal database outcome.
     sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
@@ -165,9 +199,6 @@ async def run_worker(db_config, sqs, queue_url, stop):
                     break
                 with psycopg.connect(**db_config, autocommit=True) as connection:
                     await process_message(connection, sqs, queue_url, message)
-        except SlackSendError as error:
-            logger.error("outcome=send_failed reason=%s worker_stopping=true", error)
-            return 1
         except (psycopg.Error, BotoCoreError, ClientError) as error:
             logger.warning("outcome=infrastructure_error error_type=%s", type(error).__name__)
             stop.wait(5)

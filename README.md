@@ -2,8 +2,8 @@
 
 A multi-tenant GitHub webhook platform under development. This first step provides
 a local FastAPI application, PostgreSQL 16 with psycopg 3, and an initial SQL
-schema. Signed webhook ingestion, an outbox publisher, and the delivery worker's
-claim-and-success path are implemented. Worker retry policy, DLQ recovery,
+schema. Signed webhook ingestion, an outbox publisher, and a delivery worker with
+bounded retries are implemented. DLQ recovery,
 Compose worker service integration, and AWS infrastructure remain future work.
 
 ## Remaining roadmap
@@ -161,9 +161,9 @@ architecture suggestion to reuse delivery rows for publication. Ingestion
 inserts the event, deliveries, and outbox rows in one transaction. Publication
 and notification status are independent. The publisher uses
 transactional row locking; worker lease tokens will identify individual claims so
-stale workers cannot overwrite a newer claim. The publisher and initial delivery
-worker are implemented; worker failure classification and bounded retries remain
-future work. Management API key storage is deferred to the authentication step.
+stale workers cannot overwrite a newer claim. The publisher and delivery worker
+include failure handling and retries. Management API key storage is deferred to
+the authentication step.
 
 Secret reference columns must identify recoverable values in a secure secret
 store; they must not contain raw GitHub secrets or Slack webhook URLs. The secret
@@ -185,7 +185,7 @@ Logs contain job IDs and outcomes, not payloads, secrets, or raw exception messa
 Shutdown finishes the current bounded send/transaction before exiting.
 
 A crash after SQS accepts a message but before the database commit can produce
-duplicates. The future worker must tolerate these; publication is not exactly once.
+duplicates. The worker handles terminal jobs without resending; publication is not exactly once.
 
 Set these values in `.env` before enabling the publisher:
 
@@ -339,7 +339,7 @@ real boto3 requests to Moto. It also checks invalid signatures and duplicate
 webhook handling. A separate Compose-container demo is optional; no manual
 GitHub repository webhook delivery is claimed by these tests.
 
-## Initial delivery worker
+## Delivery worker and retries
 
 `delivery_worker.py` receives one SQS message at a time using five-second long
 polling and a 90-second visibility timeout. In a short PostgreSQL transaction it
@@ -354,6 +354,8 @@ event/delivery IDs, not the full GitHub payload.
 | Active lease or future retry time | Keep the message and defer visibility until eligible |
 | Due `pending` or expired lease | Claim with a new token, then check the destination and ownership before sending |
 | Successful Slack response | Commit `succeeded`, clear the lease, then delete the message |
+| Retryable failure with attempts remaining | Commit `pending`, retry time, and sanitized reason; clear the lease before deferring visibility |
+| Permanent failure or exhausted attempts | Commit `failed` and completion time, clear the lease, then delete the message |
 | Lease lost before completion | Do not record success or delete the message |
 | Invalid message or missing delivery | Log a sanitized reason and leave the message unacknowledged |
 
@@ -378,20 +380,38 @@ for connector and timeout behavior and
 [Slack's incoming webhook documentation](https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/)
 for the POST/response contract.
 
-**This is the success-path stage, not the complete retry worker.** On an invalid
-destination, unavailable secret, timeout, or unsuccessful Slack response, the
-worker records a sanitized reason when it still owns the lease, keeps the SQS
-message, and exits with code 1 for inspection. It does not mark failure terminal
-or automatically classify HTTP errors yet. Restarting after visibility/lease
-expiry can attempt delivery again; a timeout or crash after Slack accepted a
-request can therefore produce duplicate notifications. Do not configure automatic
-restart for send failures until retry limits and failure policy are implemented.
-Database/SQS errors use a five-second reconnect/retry delay. A deletion failure
-after success is safe: a later receipt sees the terminal database state and skips
-the HTTP call.
+Each delivery has at most **five claimed attempts**, including claims interrupted
+by a crash before an HTTP response or database outcome. The first four retryable
+failures wait **5, 10, 20, and 40 seconds**. The fifth failure is terminal. An active
+fifth claim is left alone; after expiry it is marked failed without a sixth send.
+Handled send failures no longer stop the worker.
 
-Still remaining: retryable/permanent error classification, attempt limits,
-`Retry-After` handling, DLQ configuration/recovery, SSM secret resolution, and a
+Timeouts, DNS/connection failures, HTTP 408/429, and HTTP 5xx are retryable.
+Invalid or disabled destinations, invalid/missing local secret references, TLS
+validation failures, redirects, other HTTP failures, and unexpected success bodies
+are terminal. A missing/expired lease is not a destination failure: the stale
+worker neither updates the job nor deletes the message.
+
+A valid whole-number `Retry-After` on a retryable response is a minimum wait;
+the worker uses the greater of that delay and normal backoff. Missing, negative,
+fractional, and malformed values fall back to backoff. Slack documents seconds,
+so HTTP-date values are not interpreted. Values beyond 2,147,483,647 seconds are
+recorded as terminal `retry_after_out_of_range` for inspection rather than silently
+shortened. PostgreSQL retains the full due time; visibility is deferred in intervals
+of at most one hour. Early receipts check that due time without claiming another
+attempt. This avoids requesting SQS's exact maximum visibility allowance.
+
+Retry/failure updates require the current unexpired lease, checked after acquiring
+the row lock. The database commit precedes visibility changes and deletion. If a
+visibility change fails, the next receipt still observes the committed retry time.
+If a database update fails, the message stays unacknowledged and the claim can be
+recovered after expiry. Database/SQS errors use a five-second reconnect/retry delay.
+A deletion failure after either terminal outcome is safe: a later receipt skips
+HTTP and retries deletion. Terminal failures remain inspectable in `deliveries`;
+they are not automatically sent to a DLQ. A timeout or crash after Slack accepts
+a request can still produce a duplicate notification.
+
+Still remaining: DLQ configuration/recovery, SSM secret resolution, and a
 dedicated Compose worker service. `docs/architecture.md` describes the full target
 design, including these features that are not yet implemented.
 
@@ -450,17 +470,28 @@ the actual IP passed to the connector, proxy bypass prevention, redirect refusal
 and DNS/response timeouts. Local HTTP URLs are wired in only by tests; production
 has no option to disable destination validation. No real Slack messages are sent.
 
-Verified locally on November 10, 2026: **72 tests passed in 36.90 seconds** with
+The retry tests additionally exercise backoff, early duplicate receipts, final
+claim expiry, stale failure updates, database/visibility/deletion failures,
+`Retry-After` parsing and long delays, and real Moto/HTTP retry followed by success.
+
+Verified locally on November 11, 2026: **95 tests passed in 43.70 seconds** using
+PostgreSQL and Moto, including the existing ingestion/publisher/sender suite.
+The test image build, Compose configuration validation, and whitespace checks
+passed. The real queue-to-local-HTTP retry test waited for the persisted retry
+schedule and message visibility before succeeding. No AWS resources or real Slack
+notifications were used. DLQ recovery and cloud behavior remain unverified.
+
+Historical verification on November 10, 2026: **72 tests passed in 36.90 seconds** with
 PostgreSQL 16, Moto, and aiohttp 3.14.5. The test image built successfully and
 Compose configuration validation passed. This verifies the initial worker and
 sender plus the existing ingestion/publisher behavior; it does not verify real
 Slack delivery, AWS permissions, or the remaining retry/DLQ design.
 
 Compose starts the local emulator automatically for tests and waits for its
-health check. Five focused tests use a fake SQS sender; three integration tests
+health check. In the publisher suite, five focused tests use a fake SQS sender; three integration tests
 use real boto3 HTTP requests with explicit local endpoints and dummy credentials.
 Each integration test creates and deletes unique queues. No AWS access is needed.
-Without `TEST_SQS_ENDPOINT_URL`, the three emulator tests are skipped.
+Without `TEST_SQS_ENDPOINT_URL`, emulator integration tests are skipped.
 
 Coverage includes success, delayed retry, future jobs, competing database locks,
 rollback recovery, and the duplicate window after sending before commit. Process

@@ -123,13 +123,18 @@ def test_successful_post_ignores_proxy_environment(monkeypatch):
                          "unfurl_links": False, "unfurl_media": False}]
 
 
-@pytest.mark.parametrize("status, body, reason", [
-    (302, "redirect", "http_302"),
-    (429, "secret response", "http_429"),
-    (500, "secret response", "http_500"),
-    (200, "not ok", "unexpected_response"),
+@pytest.mark.parametrize("status, body, reason, retryable", [
+    (302, "redirect", "http_302", False),
+    (400, "secret response", "http_400", False),
+    (403, "secret response", "http_403", False),
+    (404, "secret response", "http_404", False),
+    (408, "secret response", "http_408", True),
+    (429, "secret response", "http_429", True),
+    (500, "secret response", "http_500", True),
+    (503, "secret response", "http_503", True),
+    (200, "not ok", "unexpected_response", False),
 ])
-def test_redirects_and_unsuccessful_responses_are_not_accepted(monkeypatch, status, body, reason):
+def test_redirects_and_unsuccessful_responses_are_not_accepted(monkeypatch, status, body, reason, retryable):
     paths = []
 
     async def handler(request):
@@ -142,6 +147,7 @@ def test_redirects_and_unsuccessful_responses_are_not_accepted(monkeypatch, stat
             with pytest.raises(SlackSendError) as error:
                 await send_slack(1, REFERENCE, "test")
             assert str(error.value) == reason
+            assert error.value.retryable is retryable
 
     asyncio.run(check())
     assert paths == ["/services/T/B/test-secret"]
@@ -156,8 +162,9 @@ def test_total_timeout_includes_dns(monkeypatch):
     monkeypatch.setattr(slack_sender.ThreadedResolver, "resolve", resolve)
     monkeypatch.setattr(slack_sender, "HTTP_TIMEOUT_SECONDS", 0.05)
     started = time.monotonic()
-    with pytest.raises(SlackSendError, match="http_timeout"):
+    with pytest.raises(SlackSendError, match="http_timeout") as error:
         asyncio.run(send_slack(1, REFERENCE, "test"))
+    assert error.value.retryable is True
     assert time.monotonic() - started < 0.8
 
 
@@ -176,4 +183,40 @@ def test_total_timeout_includes_response_body(monkeypatch):
                 await send_slack(1, REFERENCE, "test")
 
     monkeypatch.setattr(slack_sender, "HTTP_TIMEOUT_SECONDS", 0.05)
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize("header, expected", [
+    (None, None), ("120", 120), ("86400", 86400), ("0", 0),
+    (" 15 ", 15), ("-1", None), ("1.5", None), ("invalid", None),
+])
+def test_retry_after_seconds_are_preserved(monkeypatch, header, expected):
+    async def handler(request):
+        headers = {} if header is None else {"Retry-After": header}
+        return web.Response(status=429, headers=headers)
+
+    async def check():
+        async with local_receiver(handler) as url:
+            monkeypatch.setattr(slack_sender, "resolve_slack_url", lambda *_: url)
+            with pytest.raises(SlackSendError) as error:
+                await send_slack(1, REFERENCE, "test")
+            assert error.value.retryable is True
+            assert error.value.retry_after == expected
+            assert str(error.value) == "http_429"
+
+    asyncio.run(check())
+
+
+def test_unrepresentable_retry_delay_is_not_shortened(monkeypatch):
+    async def handler(request):
+        return web.Response(status=429, headers={"Retry-After": "99999999999999999999"})
+
+    async def check():
+        async with local_receiver(handler) as url:
+            monkeypatch.setattr(slack_sender, "resolve_slack_url", lambda *_: url)
+            with pytest.raises(SlackSendError) as error:
+                await send_slack(1, REFERENCE, "test")
+            assert str(error.value) == "retry_after_out_of_range"
+            assert error.value.retryable is False
+
     asyncio.run(check())
