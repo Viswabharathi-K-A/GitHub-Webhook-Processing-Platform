@@ -4,7 +4,8 @@ A multi-tenant GitHub webhook platform under development. This first step provid
 a local FastAPI application, PostgreSQL 16 with psycopg 3, and an initial SQL
 schema. Signed webhook ingestion, an outbox publisher, and a delivery worker with
 bounded retries are implemented, with Compose worker integration and explicit
-local queue/DLQ setup. Operator recovery and AWS infrastructure remain future work.
+local queue/DLQ setup. A manual local DLQ recovery procedure is provided below;
+AWS infrastructure remains future work.
 
 ## Remaining roadmap
 
@@ -238,8 +239,8 @@ claimed attempts are separate from SQS receive count: active leases, early
 receipts, and infrastructure errors can consume receives. Terminal application
 failures are committed and deleted, not automatically moved to the DLQ. Messages
 the worker cannot acknowledge, such as malformed messages, can reach the DLQ.
-Operator inspection/recovery is still a later stage. Moto redrive tests do not
-establish AWS retention or IAM behavior.
+See the local DLQ recovery procedure below for operator inspection and replay.
+Moto redrive tests do not establish AWS retention or IAM behavior.
 
 After applying the initial migration and
 setting a nonempty `GITHUB_WEBHOOK_SECRET_LOCAL` in `.env`, start the API and
@@ -434,7 +435,7 @@ HTTP and retries deletion. Terminal failures remain inspectable in `deliveries`;
 they are not automatically sent to a DLQ. A timeout or crash after Slack accepts
 a request can still produce a duplicate notification.
 
-Still remaining: operator DLQ recovery and SSM secret resolution.
+Still remaining: AWS DLQ recovery verification and SSM secret resolution.
 `docs/architecture.md` describes the full target
 design, including these features that are not yet implemented.
 
@@ -472,6 +473,128 @@ grace period; the documented OS DNS shutdown limitation still applies.
 An eventual AWS worker task role needs `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
 and `sqs:ChangeMessageVisibility` scoped to its delivery queue. The publisher's
 send-only permission is insufficient for the worker.
+
+### Inspect and recover one local DLQ message
+
+This procedure is for Compose/Moto only, not AWS. Start the database and Moto
+and run queue setup first. Fix the underlying database/worker problem before
+replaying anything. Replaying a recoverable delivery can send a real Slack message.
+Do not purge either queue or reset delivery statuses/attempt counts for recovery.
+
+Open an interactive Python session in a temporary worker container. This overrides
+the worker command; it does not start another message consumer or modify files:
+
+```powershell
+docker compose --profile worker run --rm --no-deps worker python -i
+```
+
+Paste the following at the Python prompt. Use only the fixed local endpoint and
+dummy credentials below, regardless of the AWS settings in `.env`:
+
+```python
+import json
+import boto3
+import psycopg
+from botocore.config import Config
+from delivery_worker import database_config
+
+sqs = boto3.client(
+    'sqs', endpoint_url='http://sqs:5000', region_name='us-west-2',
+    aws_access_key_id='test', aws_secret_access_key='test', aws_session_token='',
+    config=Config(connect_timeout=3, read_timeout=5,
+                  retries={'total_max_attempts': 1}, proxies={}),
+)
+queue_url = sqs.get_queue_url(QueueName='deliveries')['QueueUrl']
+dlq_url = sqs.get_queue_url(QueueName='deliveries-dlq')['QueueUrl']
+print(sqs.get_queue_attributes(
+    QueueUrl=dlq_url,
+    AttributeNames=['ApproximateNumberOfMessages', 'ApproximateNumberOfMessagesNotVisible'],
+)['Attributes'])
+```
+
+Counts are approximate. To inspect one message, run:
+
+```python
+messages = sqs.receive_message(
+    QueueUrl=dlq_url, MaxNumberOfMessages=1, WaitTimeSeconds=1,
+    VisibilityTimeout=300,
+    MessageSystemAttributeNames=['ApproximateReceiveCount'],
+).get('Messages', [])
+print('Messages received:', len(messages))
+```
+
+If none is returned, stop or poll again; one empty receive does not prove the
+queue is empty. Receiving changes the receive count and hides that message for
+five minutes. It does not delete it. Continue only when one message was received:
+
+```python
+message = messages[0]
+payload = json.loads(message['Body'])
+assert isinstance(payload, dict), 'Malformed message; leave in DLQ'
+delivery_id = payload.get('delivery_id')
+assert type(delivery_id) is int and 0 < delivery_id <= 9223372036854775807, 'Invalid delivery ID; leave in DLQ'
+print('Message ID:', message['MessageId'], 'Delivery ID:', delivery_id)
+print('Receive count:', message.get('Attributes', {}).get('ApproximateReceiveCount'))
+query = (
+    'SELECT id, tenant_id, status, attempt_count, last_error, '
+    "(attempt_count < 5 AND ((status = 'pending' AND next_attempt_at <= clock_timestamp()) "
+    "OR (status = 'processing' AND lease_expires_at <= clock_timestamp()))) AS ready "
+    'FROM deliveries WHERE id = %s'
+)
+with psycopg.connect(**database_config()) as connection:
+    row = connection.execute(query, (delivery_id,)).fetchone()
+
+print(row)
+```
+
+The tuple contains delivery ID, tenant ID, status, attempt count, sanitized error
+code, and whether it is ready to retry. Do not print raw message bodies, event
+payloads, environment values, or destination URLs. If validation fails, stop;
+do not continue to the replay commands.
+
+Decide based on the database record:
+
+| Result | Operator action |
+|---|---|
+| Missing record or malformed message | Leave in DLQ and investigate; do not invent a replacement delivery ID |
+| `pending`, not yet due, or an active `processing` lease | Wait until due/expired and inspect again |
+| Nonterminal delivery with `ready = True` | After fixing the cause and confirming the tenant/ID, replay below |
+| `succeeded` | No replay needed; delete only after explicitly confirming it is a stale duplicate |
+| `failed`, or five attempts already used | Investigate the stored failure; replay will not grant a new attempt or reset the delivery |
+
+For a ready delivery, recheck the database and run these statements **one at a
+time**, within the visibility window. Stop on any exception or failed assertion:
+
+```python
+with psycopg.connect(**database_config()) as connection:
+    row = connection.execute(query, (delivery_id,)).fetchone()
+
+assert row is not None and row[-1] is True, 'Delivery is not ready for recovery'
+sent = sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps({'delivery_id': delivery_id}))
+assert sent.get('MessageId'), 'Send did not confirm success; keep DLQ message'
+deleted = sqs.delete_message(QueueUrl=dlq_url, ReceiptHandle=message['ReceiptHandle'])
+print('Requeued delivery:', delivery_id)
+```
+
+Delete only after the send succeeds. If sending fails or its outcome is uncertain,
+leave the DLQ message. A crash or deletion failure after sending can produce a
+duplicate; the worker uses database status/leases to handle repeated messages.
+The readiness check is advisory: the worker rechecks state when claiming the job.
+This does not promise exactly-once Slack delivery after an uncertain HTTP outcome.
+
+If abandoning inspection before deletion, release the message early with:
+
+```python
+released = sqs.change_message_visibility(QueueUrl=dlq_url, ReceiptHandle=message['ReceiptHandle'], VisibilityTimeout=0)
+```
+
+If the receipt expired, receive and inspect again rather than using an old receipt.
+For a confirmed `succeeded` duplicate, the delete statement above may be used on
+its own after rechecking the ID/status; it must not be used for an unresolved job.
+Close the session with `sqs.close()` and `exit()`. Start the normal worker if it
+was stopped, then inspect the specific delivery's status/attempt count and worker
+logs. Verify `succeeded` or investigate its recorded failure; do not infer success
+from an empty queue alone. No database reset is part of this procedure.
 
 ## Tests
 
