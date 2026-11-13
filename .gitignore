@@ -28,6 +28,18 @@ dist/
 *.egg-info/
 *.log
 
+# Terraform local files, state, inputs, and saved plans.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.tfplan
+terraform.tfstate.lock.info
+crash.log
+crash.*.log
+# Keep .terraform.lock.hcl tracked for reproducible provider versions.
+
 # Editor and operating system files.
 .idea/
 .vscode/
