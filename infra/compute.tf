@@ -39,6 +39,65 @@ locals {
   ]
 }
 
+resource "aws_ecs_service" "api" {
+  name            = "${var.project_name}-api"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.api.arn
+  launch_type     = "FARGATE"
+  desired_count   = 1
+
+  health_check_grace_period_seconds = 60
+
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.api.id]
+    assign_public_ip = true
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.api.arn
+    container_name   = "api"
+    container_port   = 8000
+  }
+
+  depends_on = [
+    aws_lb_listener.https,
+    aws_iam_role_policy.execution,
+    aws_route.internet,
+    aws_route_table_association.public,
+    aws_vpc_security_group_ingress_rule.api_from_alb,
+    aws_vpc_security_group_egress_rule.alb_to_api,
+    aws_vpc_security_group_egress_rule.task_https,
+    aws_vpc_security_group_egress_rule.task_to_database,
+    aws_vpc_security_group_ingress_rule.database_from_task,
+  ]
+}
+
+resource "aws_ecs_service" "background" {
+  name            = "${var.project_name}-background"
+  cluster         = aws_ecs_cluster.main.id
+  task_definition = aws_ecs_task_definition.background.arn
+  launch_type     = "FARGATE"
+  desired_count   = 1
+
+  network_configuration {
+    subnets          = aws_subnet.public[*].id
+    security_groups  = [aws_security_group.background.id]
+    assign_public_ip = true
+  }
+
+  depends_on = [
+    aws_iam_role_policy.execution,
+    aws_iam_role_policy.background_queue,
+    aws_route.internet,
+    aws_route_table_association.public,
+    aws_vpc_security_group_egress_rule.task_https,
+    aws_vpc_security_group_egress_rule.task_to_database,
+    aws_vpc_security_group_ingress_rule.database_from_task,
+    aws_sqs_queue_redrive_allow_policy.dlq,
+  ]
+}
+
 resource "aws_ecs_task_definition" "api" {
   family                   = "${var.project_name}-api"
   requires_compatibilities = ["FARGATE"]
