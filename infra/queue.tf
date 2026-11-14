@@ -6,7 +6,7 @@ resource "aws_sqs_queue" "dlq" {
 
 resource "aws_sqs_queue" "deliveries" {
   name                       = "${var.project_name}-deliveries"
-  visibility_timeout_seconds = 90 # Matches the worker; longer than its 60-second lease.
+  visibility_timeout_seconds = 90     # Matches the worker; longer than its 60-second lease.
   message_retention_seconds  = 345600 # 4 days
   sqs_managed_sse_enabled    = true
 

@@ -52,3 +52,18 @@ output "background_log_group_name" {
   description = "CloudWatch log group for publisher and worker logs."
   value       = aws_cloudwatch_log_group.background.name
 }
+
+output "bootstrap_task_definition_arn" {
+  description = "Task definition ARN for explicitly running database bootstrap actions."
+  value       = aws_ecs_task_definition.bootstrap.arn
+}
+
+output "public_subnet_ids" {
+  description = "Public subnet IDs for the one-off bootstrap task's network configuration."
+  value       = aws_subnet.public[*].id
+}
+
+output "background_security_group_id" {
+  description = "Security group used by the background service and one-off bootstrap task."
+  value       = aws_security_group.background.id
+}

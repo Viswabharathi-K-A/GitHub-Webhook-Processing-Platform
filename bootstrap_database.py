@@ -45,9 +45,55 @@ def create_app_user(connection):
         )
 
 
+def configure_demo(connection):
+    with connection.transaction():
+        # Serialize setup and prevent configuration writes between check/insert.
+        connection.execute(
+            "LOCK TABLE tenants, sources, destinations, rules IN EXCLUSIVE MODE"
+        )
+        existing = connection.execute(
+            "SELECT EXISTS (SELECT 1 FROM tenants) "
+            "OR EXISTS (SELECT 1 FROM sources) "
+            "OR EXISTS (SELECT 1 FROM destinations) "
+            "OR EXISTS (SELECT 1 FROM rules)"
+        ).fetchone()[0]
+        if existing:
+            raise ValueError("Demo setup requires empty configuration tables")
+
+        tenant_id = connection.execute(
+            "INSERT INTO tenants (name) VALUES (%s) RETURNING id",
+            ("aws-demo",),
+        ).fetchone()[0]
+        # ECS currently injects only tenant-1 secret names. Never reset a sequence
+        # or silently bind another tenant to those secrets to bypass this check.
+        if tenant_id != 1:
+            raise ValueError("Demo setup requires a fresh tenant-1 identity")
+
+        source_id = connection.execute(
+            "INSERT INTO sources (tenant_id, name, webhook_secret_ref) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (tenant_id, "aws-github", "env:GITHUB_WEBHOOK_SECRET_TENANT_1_LOCAL"),
+        ).fetchone()[0]
+        destination_id = connection.execute(
+            "INSERT INTO destinations (tenant_id, name, webhook_url_ref) "
+            "VALUES (%s, %s, %s) RETURNING id",
+            (tenant_id, "aws-slack", "env:SLACK_WEBHOOK_URL_TENANT_1_DEMO"),
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO rules (tenant_id, source_id, destination_id, event_type) "
+            "VALUES (%s, %s, %s, %s)",
+            (tenant_id, source_id, destination_id, "push"),
+        )
+
+    print(f"Demo tenant ID: {tenant_id}; GitHub source ID: {source_id}")
+    return source_id
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["migrate", "create-app-user"])
+    parser.add_argument(
+        "action", choices=["migrate", "create-app-user", "configure-demo"]
+    )
     args = parser.parse_args()
 
     try:
@@ -63,8 +109,10 @@ def main():
         ) as connection:
             if args.action == "migrate":
                 migrate(connection)
-            else:
+            elif args.action == "create-app-user":
                 create_app_user(connection)
+            else:
+                configure_demo(connection)
     except (psycopg.Error, OSError, KeyError, ValueError):
         # Database errors can contain SQL or credentials. Keep output generic.
         print(f"Database bootstrap action '{args.action}' failed.")

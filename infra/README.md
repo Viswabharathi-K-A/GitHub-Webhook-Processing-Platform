@@ -2,7 +2,7 @@
 
 Status: configuration is being prepared. It has not been validated with Terraform
 or deployed. ECS services default to zero tasks. Complete validation and review
-the unfinished database bootstrap procedure before provisioning; upload the image
+the database bootstrap procedure before provisioning; upload the image
 and complete bootstrap before enabling services.
 
 Use PowerShell from the repository root. Commands below are instructions, not
@@ -98,10 +98,12 @@ certificate_arn                = "YOUR_ISSUED_CERTIFICATE_ARN"
 github_secret_parameter_arn     = "YOUR_GITHUB_PARAMETER_ARN"
 slack_url_parameter_arn         = "YOUR_SLACK_PARAMETER_ARN"
 database_password_parameter_arn = "YOUR_APPLICATION_PASSWORD_PARAMETER_ARN"
+database_admin_password_parameter_arn = "YOUR_ADMINISTRATOR_PASSWORD_PARAMETER_ARN"
 ```
 
-Provision three SSM SecureString values outside Terraform: the tenant-1 GitHub
-secret, tenant-1 Slack URL, and restricted `webhook_app` database password.
+Provision four SSM SecureString values outside Terraform: the tenant-1 GitHub
+secret, tenant-1 Slack URL, restricted `webhook_app` database password, and the
+`webhook_admin` password matching the ephemeral RDS input.
 Use the default AWS-managed SSM key for the current IAM policy. Customer-managed
 keys require separately reviewed KMS permissions. Secret creation commands must
 avoid putting literal values in shell history or printing decrypted values.
@@ -157,24 +159,112 @@ temporary token and updates local Docker credentials. Push uploads the image and
 incurs storage usage. Check each command's exit code before proceeding; update
 `image_uri` to match the pushed image.
 
-### Database bootstrap: unfinished prerequisite
+### Database bootstrap
 
-The production image excludes `migrations/`; there is not yet an approved
-migration task or command. Define a small, explicit one-off procedure before
-deployment. Do not run migrations on every application startup or open RDS to
-the internet for convenience.
+The production image includes `bootstrap_database.py` and migration 001. A
+separate task definition uses the administrator secret; normal service roles
+cannot read it. The operator needs permission to run this task and pass its
+execution role. Do not run migrations automatically on application startup.
 
-The procedure must:
+Keep services stopped. After the initial apply and image push, read identifiers
+from state, checking each Terraform command succeeds before continuing:
 
-- Carry the reviewed `migrations/001_initial_schema.sql` to the controlled task.
-- Obtain administrator credentials securely, without granting the application
-  execution roles access to those credentials.
-- Run migration 001 once, fail on SQL errors, and verify its transaction commits.
-- Create `webhook_app` using the password stored in its SSM parameter, granting
-  only required schema/table/sequence privileges and no schema ownership or DDL.
-- Configure tenant 1 using `env:GITHUB_WEBHOOK_SECRET_TENANT_1_LOCAL` and
-  `env:SLACK_WEBHOOK_URL_TENANT_1_DEMO` references, never raw secret values.
-- Verify application database access using TLS and clean up bootstrap artifacts.
+```powershell
+$cluster = terraform -chdir=infra output -raw ecs_cluster_name
+$bootstrapDefinition = terraform -chdir=infra output -raw bootstrap_task_definition_arn
+$bootstrapSubnets = terraform -chdir=infra output -json public_subnet_ids | ConvertFrom-Json
+$bootstrapSecurityGroup = terraform -chdir=infra output -raw background_security_group_id
+```
+
+The following block launches one task, incurs brief Fargate/public IPv4 usage,
+and changes PostgreSQL. Obtain approval for each action before running it.
+Run the block once per action, in this order, checking success before proceeding:
+
+1. `$action = 'migrate'`: create the schema.
+2. `$action = 'create-app-user'`: create the restricted login and grants.
+3. `$action = 'configure-demo'`: insert the tenant, source, Slack destination and
+   enabled `push` routing rule.
+
+Do not run actions concurrently. Repeated migration/user setup fails if the
+objects exist; demo configuration rejects nonempty configuration tables.
+Build and push an image containing all three actions before launching tasks.
+
+```powershell
+$action = 'migrate' # Later invocations: 'create-app-user', then 'configure-demo'
+$bootstrapRequest = @{
+    cluster = $cluster
+    taskDefinition = $bootstrapDefinition
+    launchType = 'FARGATE'
+    count = 1
+    clientToken = [guid]::NewGuid().ToString()
+    networkConfiguration = @{
+        awsvpcConfiguration = @{
+            subnets = @($bootstrapSubnets)
+            securityGroups = @($bootstrapSecurityGroup)
+            assignPublicIp = 'ENABLED'
+        }
+    }
+    overrides = @{
+        containerOverrides = @(@{
+            name = 'bootstrap'
+            command = @('python', 'bootstrap_database.py', $action)
+        })
+    }
+}
+# Initialized Terraform directory is ignored by Git. The request has no secrets.
+$requestPath = Join-Path (Resolve-Path 'infra/.terraform').Path 'bootstrap-request.json'
+[System.IO.File]::WriteAllText($requestPath, ($bootstrapRequest | ConvertTo-Json -Depth 10))
+$launchJson = aws ecs run-task --cli-input-json "file://$requestPath" --region us-west-2 --output json --no-cli-pager
+if ($LASTEXITCODE -ne 0) { throw 'Launch outcome uncertain; inspect ECS before retrying.' }
+$launch = $launchJson | ConvertFrom-Json
+if (@($launch.failures).Count -gt 0 -or @($launch.tasks).Count -ne 1) {
+    throw 'ECS did not launch exactly one task; inspect the launch response.'
+}
+$bootstrapTask = $launch.tasks[0].taskArn
+$bootstrapTask
+
+aws ecs wait tasks-stopped --cluster $cluster --tasks $bootstrapTask --region us-west-2
+if ($LASTEXITCODE -ne 0) { throw 'Wait failed; inspect the existing task rather than launching another.' }
+$resultJson = aws ecs describe-tasks --cluster $cluster --tasks $bootstrapTask --region us-west-2 --output json --no-cli-pager
+if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the task.' }
+$result = $resultJson | ConvertFrom-Json
+if (@($result.failures).Count -gt 0 -or @($result.tasks).Count -ne 1) {
+    throw 'Task status unavailable; inspect ECS.'
+}
+$container = @($result.tasks[0].containers | Where-Object name -eq 'bootstrap')
+if ($container.Count -ne 1 -or $null -eq $container[0].exitCode -or $container[0].exitCode -ne 0) {
+    throw 'Bootstrap failed or never started; inspect task status and bootstrap logs.'
+}
+Write-Output "Bootstrap action $action succeeded."
+Remove-Item -LiteralPath $requestPath
+```
+
+`tasks-stopped` and `describe-tasks` only read status. STOPPED alone does not
+mean success: image pulls, secret injection or SQL may have failed. Inspect
+the container exit code and the background log group's `bootstrap/bootstrap/`
+stream. On a timeout or uncertain launch response, inspect existing tasks first;
+the request file preserves the client token for an identical launch retry.
+Do not generate a new request/token until the previous outcome is understood.
+
+Each action commits separately. If an action fails, investigate before retrying;
+do not rerun earlier successful actions. Six local PostgreSQL tests passed for
+migration/rerun handling, grant rollback, restricted permissions, correct demo
+routing, repeat rejection and demo transaction rollback. These AWS commands have
+not been verified against ECS/RDS.
+
+`configure-demo` requires empty configuration tables and a generated tenant ID
+of 1, matching the current task environment mappings. It stores only
+`env:GITHUB_WEBHOOK_SECRET_TENANT_1_LOCAL` and
+`env:SLACK_WEBHOOK_URL_TENANT_1_DEMO` references, never raw secret values. It logs
+the committed source ID. Use that ID in GitHub's webhook URL:
+`https://YOUR_HOSTNAME/webhooks/github/SOURCE_ID`, selecting `push` events and
+the GitHub secret provisioned in SSM.
+
+If setup rolls back after consuming identity values, PostgreSQL sequences are
+not rolled back. Empty tables alone therefore do not guarantee tenant ID 1.
+Inspect a failed setup rather than resetting sequences or deleting existing
+data automatically. Verify all three actions succeed and application access
+works before enabling services with `start_services = true`.
 
 Application connections currently use `PGSSLMODE=require`: traffic is encrypted,
 but server identity is not verified as it would be with `verify-full` and a

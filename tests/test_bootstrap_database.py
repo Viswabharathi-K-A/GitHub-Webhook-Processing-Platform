@@ -11,6 +11,45 @@ import bootstrap_database
 from main import database_config
 
 
+def test_configure_demo_creates_enabled_push_route(bootstrap_db):
+    bootstrap_database.migrate(bootstrap_db)
+    source_id = bootstrap_database.configure_demo(bootstrap_db)
+    route = bootstrap_db.execute(
+        "SELECT r.tenant_id, s.id, s.webhook_secret_ref, d.webhook_url_ref, "
+        "r.event_type, s.enabled, d.enabled, r.enabled "
+        "FROM rules r JOIN sources s ON s.id = r.source_id "
+        "JOIN destinations d ON d.id = r.destination_id"
+    ).fetchall()
+    assert route == [(
+        1, source_id, "env:GITHUB_WEBHOOK_SECRET_TENANT_1_LOCAL",
+        "env:SLACK_WEBHOOK_URL_TENANT_1_DEMO", "push", True, True, True,
+    )]
+
+
+def test_configure_demo_rejects_existing_configuration(bootstrap_db):
+    bootstrap_database.migrate(bootstrap_db)
+    source_id = bootstrap_database.configure_demo(bootstrap_db)
+    with pytest.raises(ValueError, match="empty configuration"):
+        bootstrap_database.configure_demo(bootstrap_db)
+    assert bootstrap_db.execute("SELECT id FROM sources").fetchall() == [(source_id,)]
+    assert bootstrap_db.execute("SELECT count(*) FROM tenants").fetchone() == (1,)
+    assert bootstrap_db.execute("SELECT count(*) FROM destinations").fetchone() == (1,)
+    assert bootstrap_db.execute("SELECT count(*) FROM rules").fetchone() == (1,)
+
+
+def test_configure_demo_rolls_back_when_rule_insert_fails(bootstrap_db):
+    bootstrap_database.migrate(bootstrap_db)
+    bootstrap_db.execute(
+        "ALTER TABLE rules ADD CONSTRAINT reject_demo CHECK (false)"
+    )
+    with pytest.raises(psycopg.errors.CheckViolation):
+        bootstrap_database.configure_demo(bootstrap_db)
+    assert bootstrap_db.execute(
+        "SELECT (SELECT count(*) FROM tenants), (SELECT count(*) FROM sources), "
+        "(SELECT count(*) FROM destinations), (SELECT count(*) FROM rules)"
+    ).fetchone() == (0, 0, 0, 0)
+
+
 @pytest.fixture
 def bootstrap_db(monkeypatch):
     # These tests create a database and a cluster-wide role. Never run against
