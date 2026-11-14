@@ -12,7 +12,7 @@ remote SQL, starting services, or destroying resources.
 
 ## Architecture
 
-One Terraform root manages the application in us-west-2:
+One Terraform root manages the application in us-east-2:
 
 - Public HTTPS ALB across two public subnets.
 - One API Fargate task and one background task containing publisher and worker.
@@ -23,8 +23,9 @@ One Terraform root manages the application in us-west-2:
 There is no NAT Gateway, autoscaling, or multi-AZ database failover. Rolling
 deployments can temporarily run extra tasks. ALB, Fargate, RDS, public IPv4,
 storage and usage incur charges. Reconfirm the regional estimate before apply;
-the earlier low-traffic planning budget was approximately $3-$5 for 24 hours,
-excluding domain registration and taxes. Destroy application resources after
+the earlier Oregon low-traffic planning budget was approximately $3-$5 for 24
+hours, excluding domain registration and taxes. Recalculate for Ohio before
+provisioning. Destroy application resources after
 recording evidence rather than leaving them running.
 
 ## Local preparation
@@ -53,22 +54,55 @@ variable files. Formatting fixes should be reviewed before editing more files.
 
 ## Account, hostname and protected state
 
-Use a named AWS profile authenticated with temporary credentials where possible.
-Never use the root account for deployment. Set the intended profile and region:
+The current AWS Settings project is Idea Incubator in Ohio (`us-east-2`). Use
+browser-based temporary credentials, not root credentials or long-term access
+keys. Project IAM users cannot sign in to the console; the project owner signs
+in through AWS Settings and receives an assumed-role session.
+
+Run this interactive login locally and select Idea Incubator in the browser:
 
 ```powershell
-$env:AWS_PROFILE = 'YOUR_PROFILE'
-$env:AWS_DEFAULT_REGION = 'us-west-2'
-aws sts get-caller-identity --region us-west-2
+aws login --profile webhook-login --region us-east-2
+aws sts get-caller-identity --profile webhook-login --region us-east-2
+```
+
+Login writes a local temporary-credential cache. STS only reads identity. Confirm
+the intended account and an assumed-role ARN such as `AccountFullAccessRole`;
+that role name does not override project service/region restrictions.
+
+For compatibility with Terraform and its S3 backend, use the CLI's documented
+process-credential bridge. These commands write only local AWS profile settings;
+they do not create AWS resources. Run them once after reviewing the profile name:
+
+```powershell
+aws configure set credential_process 'aws configure export-credentials --profile webhook-login --format process' --profile webhook-terraform
+aws configure set region us-east-2 --profile webhook-terraform
+```
+
+Keep the two profile names distinct to avoid recursive credential resolution.
+Set the profile for subsequent Terraform and AWS commands in this terminal:
+
+```powershell
+$env:AWS_PROFILE = 'webhook-terraform'
+$env:AWS_DEFAULT_REGION = 'us-east-2'
+aws sts get-caller-identity --region us-east-2
 ```
 
 The STS command is read-only: verify the account and role before any mutation.
+When the login session expires, repeat `aws login --profile webhook-login
+--region us-east-2`. Never print the output of `export-credentials` or copy
+credentials into Terraform, `.env`, container definitions or Git. The CLI's
+process bridge supplies refreshed credentials directly to the consuming tool.
+
+AWS documentation lists the required services as supported in the project
+experience. Actual permissions, quotas and availability still need verification.
+Do not activate advanced features or change account plans as part of setup.
 
 Before application provisioning:
 
-1. Obtain a hostname you control and an issued ACM certificate in us-west-2.
+1. Obtain a hostname you control and an issued ACM certificate in us-east-2.
    Certificate DNS validation requires access to that hostname's DNS records.
-2. Bootstrap a separate S3 state bucket in us-west-2, with versioning,
+2. Bootstrap a separate S3 state bucket in us-east-2, with versioning,
    encryption, all public access blocked, HTTPS-only access, and restricted IAM.
    This bucket is outside this root's lifecycle. Review its exact creation
    commands and permissions before execution.
@@ -91,9 +125,9 @@ Create an ignored `infra/demo.tfvars` with non-secret deployment inputs:
 
 ```hcl
 project_name                   = "webhook-platform"
-aws_region                     = "us-west-2"
+aws_region                     = "us-east-2"
 start_services                 = false
-image_uri                      = "ACCOUNT.dkr.ecr.us-west-2.amazonaws.com/webhook-platform:demo-001"
+image_uri                      = "ACCOUNT.dkr.ecr.us-east-2.amazonaws.com/webhook-platform:demo-001"
 certificate_arn                = "YOUR_ISSUED_CERTIFICATE_ARN"
 github_secret_parameter_arn     = "YOUR_GITHUB_PARAMETER_ARN"
 slack_url_parameter_arn         = "YOUR_SLACK_PARAMETER_ARN"
@@ -146,11 +180,11 @@ After ECR exists, set these values from the actual repository and chosen unique
 tag. Immutable tags cannot be overwritten:
 
 ```powershell
-$repository = 'ACCOUNT.dkr.ecr.us-west-2.amazonaws.com/webhook-platform'
+$repository = 'ACCOUNT.dkr.ecr.us-east-2.amazonaws.com/webhook-platform'
 $registry = $repository.Split('/')[0]
 $image = "${repository}:demo-001"
 docker build --platform linux/amd64 --target production -t $image .
-aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin $registry
+aws ecr get-login-password --region us-east-2 | docker login --username AWS --password-stdin $registry
 docker push $image
 ```
 
@@ -214,7 +248,7 @@ $bootstrapRequest = @{
 # Initialized Terraform directory is ignored by Git. The request has no secrets.
 $requestPath = Join-Path (Resolve-Path 'infra/.terraform').Path 'bootstrap-request.json'
 [System.IO.File]::WriteAllText($requestPath, ($bootstrapRequest | ConvertTo-Json -Depth 10))
-$launchJson = aws ecs run-task --cli-input-json "file://$requestPath" --region us-west-2 --output json --no-cli-pager
+$launchJson = aws ecs run-task --cli-input-json "file://$requestPath" --region us-east-2 --output json --no-cli-pager
 if ($LASTEXITCODE -ne 0) { throw 'Launch outcome uncertain; inspect ECS before retrying.' }
 $launch = $launchJson | ConvertFrom-Json
 if (@($launch.failures).Count -gt 0 -or @($launch.tasks).Count -ne 1) {
@@ -223,9 +257,9 @@ if (@($launch.failures).Count -gt 0 -or @($launch.tasks).Count -ne 1) {
 $bootstrapTask = $launch.tasks[0].taskArn
 $bootstrapTask
 
-aws ecs wait tasks-stopped --cluster $cluster --tasks $bootstrapTask --region us-west-2
+aws ecs wait tasks-stopped --cluster $cluster --tasks $bootstrapTask --region us-east-2
 if ($LASTEXITCODE -ne 0) { throw 'Wait failed; inspect the existing task rather than launching another.' }
-$resultJson = aws ecs describe-tasks --cluster $cluster --tasks $bootstrapTask --region us-west-2 --output json --no-cli-pager
+$resultJson = aws ecs describe-tasks --cluster $cluster --tasks $bootstrapTask --region us-east-2 --output json --no-cli-pager
 if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the task.' }
 $result = $resultJson | ConvertFrom-Json
 if (@($result.failures).Count -gt 0 -or @($result.tasks).Count -ne 1) {
@@ -303,8 +337,8 @@ $cluster = terraform -chdir=infra output -raw ecs_cluster_name
 $api = terraform -chdir=infra output -raw api_service_name
 $background = terraform -chdir=infra output -raw background_service_name
 $targetGroup = terraform -chdir=infra output -raw api_target_group_arn
-aws ecs describe-services --cluster $cluster --services $api $background --region us-west-2
-aws elbv2 describe-target-health --target-group-arn $targetGroup --region us-west-2
+aws ecs describe-services --cluster $cluster --services $api $background --region us-east-2
+aws elbv2 describe-target-health --target-group-arn $targetGroup --region us-east-2
 ```
 
 The AWS describe commands are read-only. Confirm one running task per service,
@@ -350,3 +384,5 @@ and versions need separate handling if the bucket is ultimately removed.
 - [Terraform initialization](https://developer.hashicorp.com/terraform/cli/commands/init)
 - [ECR image authentication and push](https://docs.aws.amazon.com/AmazonECR/latest/userguide/docker-push-ecr-image.html)
 - [ECS SSM secret injection](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/secrets-envvar-ssm-paramstore.html)
+- [Browser login and process-credential bridge](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sign-in.html)
+- [Project access management](https://docs.aws.amazon.com/accounts/latest/reference/sign-up-for-aws.html)

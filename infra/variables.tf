@@ -7,7 +7,7 @@ variable "project_name" {
 variable "aws_region" {
   description = "AWS region for the application resources."
   type        = string
-  default     = "us-west-2"
+  default     = "us-east-2"
 }
 
 variable "image_uri" {
