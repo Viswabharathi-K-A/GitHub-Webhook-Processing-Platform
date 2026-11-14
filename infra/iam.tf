@@ -11,7 +11,7 @@ locals {
 
 # Execution roles are used by ECS to start containers, not by application code.
 resource "aws_iam_role" "execution" {
-  for_each = toset(["api", "background"])
+  for_each = toset(["api", "background", "bootstrap"])
 
   name               = "${var.project_name}-${each.key}-execution"
   assume_role_policy = local.ecs_task_trust_policy
@@ -31,6 +31,14 @@ resource "aws_iam_role_policy" "execution" {
       parameter_arns = [
         var.database_password_parameter_arn,
         var.slack_url_parameter_arn,
+      ]
+    }
+    # Only the explicitly launched bootstrap task receives the admin password.
+    bootstrap = {
+      log_group_arn = aws_cloudwatch_log_group.background.arn
+      parameter_arns = [
+        var.database_admin_password_parameter_arn,
+        var.database_password_parameter_arn,
       ]
     }
   }

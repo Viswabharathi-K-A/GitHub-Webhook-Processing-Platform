@@ -137,6 +137,51 @@ resource "aws_ecs_task_definition" "api" {
   }])
 }
 
+resource "aws_ecs_task_definition" "bootstrap" {
+  family                   = "${var.project_name}-bootstrap"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.execution["bootstrap"].arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "X86_64"
+  }
+
+  # No ECS service uses this definition. Launch each action explicitly and
+  # inspect its exit code before proceeding. The script needs no AWS task role.
+  container_definitions = jsonencode([{
+    name        = "bootstrap"
+    image       = var.image_uri
+    essential   = true
+    stopTimeout = 30
+    command     = ["python", "bootstrap_database.py", "migrate"]
+    environment = [
+      { name = "POSTGRES_HOST", value = aws_db_instance.main.address },
+      { name = "POSTGRES_PORT", value = "5432" },
+      { name = "POSTGRES_DB", value = aws_db_instance.main.db_name },
+      { name = "POSTGRES_USER", value = aws_db_instance.main.username },
+      { name = "PGSSLMODE", value = "require" },
+    ]
+    secrets = [
+      { name = "POSTGRES_PASSWORD", valueFrom = var.database_admin_password_parameter_arn },
+      { name = "APP_DATABASE_PASSWORD", valueFrom = var.database_password_parameter_arn },
+    ]
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.background.name
+        awslogs-region        = var.aws_region
+        awslogs-stream-prefix = "bootstrap"
+      }
+    }
+  }])
+
+  depends_on = [aws_iam_role_policy.execution]
+}
+
 resource "aws_ecs_task_definition" "background" {
   family                   = "${var.project_name}-background"
   requires_compatibilities = ["FARGATE"]

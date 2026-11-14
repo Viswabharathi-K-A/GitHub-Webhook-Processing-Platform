@@ -47,3 +47,8 @@ variable "database_password_parameter_arn" {
   description = "SSM SecureString parameter ARN containing the restricted webhook_app user's password, injected as POSTGRES_PASSWORD; create this user during database bootstrap."
   type        = string
 }
+
+variable "database_admin_password_parameter_arn" {
+  description = "SSM SecureString parameter ARN for the bootstrap task's webhook_admin password; its value must match database_password supplied to RDS."
+  type        = string
+}
