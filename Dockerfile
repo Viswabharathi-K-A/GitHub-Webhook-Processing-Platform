@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN useradd --create-home appuser
 COPY main.py outbox_publisher.py delivery_worker.py slack_sender.py setup_local_sqs.py ./
+COPY bootstrap_database.py ./
 USER appuser
 
 EXPOSE 8000
@@ -26,3 +27,4 @@ USER appuser
 CMD ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
 
 FROM base AS production
+COPY migrations ./migrations

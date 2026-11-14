@@ -1,8 +1,9 @@
 # Temporary AWS demonstration
 
 Status: configuration is being prepared. It has not been validated with Terraform
-or deployed. Do not run a full apply yet: the image and database bootstrap
-procedure must be completed before the ECS services start.
+or deployed. ECS services default to zero tasks. Complete validation and review
+the unfinished database bootstrap procedure before provisioning; upload the image
+and complete bootstrap before enabling services.
 
 Use PowerShell from the repository root. Commands below are instructions, not
 evidence that they have run. Explain each AWS operation and review its result.
@@ -91,6 +92,7 @@ Create an ignored `infra/demo.tfvars` with non-secret deployment inputs:
 ```hcl
 project_name                   = "webhook-platform"
 aws_region                     = "us-west-2"
+start_services                 = false
 image_uri                      = "ACCOUNT.dkr.ecr.us-west-2.amazonaws.com/webhook-platform:demo-001"
 certificate_arn                = "YOUR_ISSUED_CERTIFICATE_ARN"
 github_secret_parameter_arn     = "YOUR_GITHUB_PARAMETER_ARN"
@@ -116,19 +118,25 @@ replacement tasks; running containers do not refresh secrets automatically.
 
 ## First deployment: required order
 
-The current ECS services request one task each immediately. A full initial apply
-would start them before migrations and image upload. Before deployment, finalize
-and review a staged bootstrap procedure that keeps services stopped until ready.
-Do not use routine targeted applies as a substitute for that documented sequence.
+Keep `start_services = false` for the initial apply. Terraform creates the ECS
+services with zero tasks, so they do not pull the image or connect to PostgreSQL.
+Other resources, including ALB and RDS, still incur charges. Supply the intended
+ECR image URI even before that image is uploaded; the task definitions reference
+it but do not run it. No targeted apply is needed for this startup sequence.
 
 1. Prepare state, certificate, inputs and operator-provisioned secrets.
-2. Provision the network, ECR, database, queues, roles and logs with services
-   prevented from starting. Review the exact bootstrap plan first.
+2. Review and approve an initial plan with `start_services = false`, then
+   provision infrastructure with both ECS services at zero tasks.
 3. Build and push the production image to the created repository.
 4. Run a controlled one-off task with private database access to apply the
    reviewed migration and create the restricted application login.
 5. Create tenant/source/destination/rule configuration through reviewed SQL.
-6. Start both services, point the hostname at the ALB and verify HTTPS.
+6. Set `start_services = true` in the local inputs, review and approve a new plan,
+   then apply it to start one task per service. Point the hostname at the ALB
+   and verify HTTPS. Keep this value true for subsequent running deployments.
+
+Setting the input back to false and applying stops service tasks, but does not
+destroy the remaining infrastructure or stop all charges.
 
 ### Build and push image
 
@@ -174,7 +182,8 @@ trusted RDS CA bundle. Keep this limitation explicit when reviewing deployment.
 
 ## Reviewed plan and apply
 
-Only after bootstrap/startup ordering is resolved, create and inspect a plan:
+After validation and review of the bootstrap procedure, create and inspect the
+initial plan with `start_services = false` in `demo.tfvars`:
 
 ```powershell
 terraform -chdir=infra plan -var-file=demo.tfvars -out=deploy.tfplan

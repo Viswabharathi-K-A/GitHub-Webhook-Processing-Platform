@@ -44,7 +44,7 @@ resource "aws_ecs_service" "api" {
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.api.arn
   launch_type     = "FARGATE"
-  desired_count   = 1
+  desired_count   = var.start_services ? 1 : 0
 
   health_check_grace_period_seconds = 60
 
@@ -78,7 +78,7 @@ resource "aws_ecs_service" "background" {
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.background.arn
   launch_type     = "FARGATE"
-  desired_count   = 1
+  desired_count   = var.start_services ? 1 : 0
 
   network_configuration {
     subnets          = aws_subnet.public[*].id

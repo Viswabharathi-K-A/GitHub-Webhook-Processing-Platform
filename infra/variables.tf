@@ -15,6 +15,12 @@ variable "image_uri" {
   type        = string
 }
 
+variable "start_services" {
+  description = "Start one task per ECS service only after the image is pushed and database bootstrap is complete."
+  type        = bool
+  default     = false
+}
+
 variable "certificate_arn" {
   description = "ARN of an issued ACM certificate in the application region for the HTTPS hostname."
   type        = string
