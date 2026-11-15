@@ -10,26 +10,11 @@ The temporary deployment uses Ohio (`us-east-2`); it is not intended to stay onl
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    GH[GitHub] -->|HTTPS signed webhook| ALB[HTTPS ALB]
-    subgraph ECS[Two ECS Fargate services]
-        API[API service: FastAPI]
-        subgraph BG[Background service: one task, two containers]
-            PUB[Outbox publisher]
-            WORK[Delivery worker]
-        end
-    end
-    ALB --> API
-    API -->|One transaction: event, deliveries, outbox| DB[(Private RDS PostgreSQL 16)]
-    PUB -->|Read and lock due outbox rows| DB
-    PUB -->|Delivery ID| Q[SQS standard queue]
-    PUB -->|Record publication| DB
-    Q --> WORK
-    WORK -->|Claim and record outcome| DB
-    WORK -->|HTTPS| SLACK[Slack]
-    Q -->|Redrive after 10 receives| DLQ[Dead-letter queue]
-```
+![AWS architecture showing the VPC, subnets, ECS services, RDS, SQS, and GitHub-to-Slack delivery flow](docs/diagrams/aws-architecture.png)
+
+[View full-size PNG](docs/diagrams/aws-architecture.png) | [Editable draw.io file](docs/diagrams/aws-architecture.drawio) | [Scalable SVG](docs/diagrams/aws-architecture.svg)
+
+Availability-zone and task placement are schematic; RDS is single-AZ with no standby.
 
 The transactional outbox prevents lost publication intent between a database
 commit and queue publication. Queue messages and external sends can repeat;
