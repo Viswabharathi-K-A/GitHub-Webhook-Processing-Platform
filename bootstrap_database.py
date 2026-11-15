@@ -39,6 +39,10 @@ def create_app_user(connection):
             "GRANT INSERT ON events, deliveries, outbox TO webhook_app"
         )
         connection.execute("GRANT UPDATE ON deliveries, outbox TO webhook_app")
+        # FOR SHARE requires UPDATE privilege on at least one column per table.
+        connection.execute(
+            "GRANT UPDATE (id) ON sources, rules, destinations TO webhook_app"
+        )
         connection.execute(
             "GRANT USAGE ON SEQUENCE events_id_seq, deliveries_id_seq, "
             "outbox_id_seq TO webhook_app"

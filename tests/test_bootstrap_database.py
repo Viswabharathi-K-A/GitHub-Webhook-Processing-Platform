@@ -120,6 +120,10 @@ def test_app_user_can_process_events_but_cannot_manage_configuration(bootstrap_d
         autocommit=True,
     ) as app:
         assert app.execute("SELECT id FROM sources").fetchone() == (1,)
+        # Webhook ingestion locks configuration rows using the restricted role.
+        assert app.execute("SELECT id FROM sources FOR SHARE").fetchone() == (1,)
+        app.execute("SELECT id FROM rules FOR SHARE")
+        app.execute("SELECT id FROM destinations FOR SHARE")
         assert app.execute(
             "INSERT INTO events (tenant_id, source_id, github_delivery_id, "
             "event_type, payload) VALUES (1, 1, %s, 'push', '{}') RETURNING id",
@@ -132,6 +136,8 @@ def test_app_user_can_process_events_but_cannot_manage_configuration(bootstrap_d
         app.execute("UPDATE outbox SET status = 'published' WHERE false")
         for statement in [
             "UPDATE sources SET enabled = false",
+            "UPDATE rules SET enabled = false",
+            "UPDATE destinations SET enabled = false",
             "DELETE FROM events",
             "CREATE TABLE public.unwanted (id integer)",
             "ALTER TABLE events ADD COLUMN unwanted integer",
