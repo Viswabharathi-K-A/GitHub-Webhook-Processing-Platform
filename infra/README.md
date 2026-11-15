@@ -1,9 +1,12 @@
 # Temporary AWS demonstration
 
-Status: configuration is being prepared. It has not been validated with Terraform
-or deployed. ECS services default to zero tasks. Complete validation and review
-the database bootstrap procedure before provisioning; upload the image
-and complete bootstrap before enabling services.
+Status: the temporary Ohio deployment has been provisioned and exercised with
+real GitHub-to-Slack delivery and duplicate suppression. Both ECS services and
+ALB target health were checked. See [deployment evidence](../README.md#deployment-evidence).
+AWS retry/DLQ recovery and final teardown have not yet been verified.
+
+Services default to zero tasks in the configuration; complete image publication
+and all database bootstrap actions before setting `start_services = true`.
 
 Use PowerShell from the repository root. Commands below are instructions, not
 evidence that they have run. Explain each AWS operation and review its result.
@@ -283,8 +286,27 @@ Do not generate a new request/token until the previous outcome is understood.
 Each action commits separately. If an action fails, investigate before retrying;
 do not rerun earlier successful actions. Six local PostgreSQL tests passed for
 migration/rerun handling, grant rollback, restricted permissions, correct demo
-routing, repeat rejection and demo transaction rollback. These AWS commands have
-not been verified against ECS/RDS.
+routing, repeat rejection and demo transaction rollback. The three bootstrap actions were also run successfully against ECS/RDS during
+the demonstration; each task exited with code 0.
+
+### Restricted-role permission repair
+
+The first cloud webhook returned 503 because `SELECT ... FOR SHARE` requires
+UPDATE privilege on at least one column of each locked table. The current
+`create_app_user` code grants `UPDATE (id)` on `sources`, `rules`, and
+`destinations`. This permits ID updates but not changes to configuration fields
+such as `enabled`. Six local bootstrap tests passed, including the locking and
+restricted-field checks.
+
+The existing RDS login was repaired using a separately approved one-off bootstrap
+command override. It applied the grant and verified `FOR SHARE` and denied
+`enabled` updates under `SET LOCAL ROLE webhook_app` before committing. The
+repair task exited with code 0; service restarts were unnecessary.
+
+The published `demo-001` image predates this code fix. Build and push a new immutable
+tag before a future fresh bootstrap. Do not rerun `create-app-user` on an existing
+login; it deliberately rejects an existing role. Any repair to an existing
+database requires reviewed SQL and separate approval.
 
 `configure-demo` requires empty configuration tables and a generated tenant ID
 of 1, matching the current task environment mappings. It stores only

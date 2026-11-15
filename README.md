@@ -1,32 +1,95 @@
-# GitHub Webhook Processing Platform
+# Multi-Tenant GitHub Webhook Processing Platform
 
-A multi-tenant GitHub webhook platform under development. This first step provides
-a local FastAPI application, PostgreSQL 16 with psycopg 3, and an initial SQL
-schema. Signed webhook ingestion, an outbox publisher, and a delivery worker with
-bounded retries are implemented, with Compose worker integration and explicit
-local queue/DLQ setup. A manual local DLQ recovery procedure is provided below;
-AWS infrastructure remains future work.
+A Python backend that securely accepts GitHub webhooks, routes events by tenant,
+and delivers Slack notifications asynchronously. Built with FastAPI, PostgreSQL,
+SQS, Docker, Terraform, and ECS Fargate, using explicit SQL rather than an ORM.
 
-## Remaining roadmap
+**AWS demonstration verified:** a real GitHub push reached Slack, and redelivery
+of the same GitHub delivery returned `200 duplicate` without another notification.
+The temporary deployment uses Ohio (`us-east-2`); it is not intended to stay online.
 
-The detailed [architecture and roadmap](docs/architecture.md#7-development-roadmap)
-distinguish implemented behavior from planned work:
+## Architecture
 
-| Stage | Goal |
+```mermaid
+flowchart LR
+    GH[GitHub] -->|HTTPS signed webhook| ALB[HTTPS ALB]
+    subgraph ECS[Two ECS Fargate services]
+        API[API service: FastAPI]
+        subgraph BG[Background service: one task, two containers]
+            PUB[Outbox publisher]
+            WORK[Delivery worker]
+        end
+    end
+    ALB --> API
+    API -->|One transaction: event, deliveries, outbox| DB[(Private RDS PostgreSQL 16)]
+    PUB -->|Read and lock due outbox rows| DB
+    PUB -->|Delivery ID| Q[SQS standard queue]
+    PUB -->|Record publication| DB
+    Q --> WORK
+    WORK -->|Claim and record outcome| DB
+    WORK -->|HTTPS| SLACK[Slack]
+    Q -->|Redrive after 10 receives| DLQ[Dead-letter queue]
+```
+
+The transactional outbox prevents lost publication intent between a database
+commit and queue publication. Queue messages and external sends can repeat;
+this system does **not** promise exactly-once Slack delivery.
+
+- **Security:** raw-body HMAC-SHA256, constant-time signature comparison,
+  tenant-scoped routing and composite foreign keys, parameterized SQL, and
+  restricted Slack destinations with DNS/address checks and redirect refusal.
+- **Reliability:** database uniqueness constraints, atomic ingestion, publisher
+  retries, token-based worker leases, five-attempt delivery limits, and SQS visibility.
+- **AWS:** public HTTPS ALB, two Fargate services, private single-AZ RDS,
+  ECR, SQS/DLQ, CloudWatch logs, SSM SecureString injection, scoped IAM, and
+  encrypted S3 Terraform state with native locking.
+- **Scope:** GitHub sources, Slack destinations, and operator-managed SQL
+  configuration. There is no public management API or dashboard.
+
+See [architecture and tradeoffs](docs/architecture.md) and the
+[AWS deployment/bootstrap/teardown runbook](infra/README.md).
+The sections below provide the detailed local setup and recovery procedures.
+
+## Deployment evidence
+
+| Result | Screenshot |
 |---|---|
-| 2 — Delivery worker | Slack-only delivery with PostgreSQL idempotency/leases, bounded retries, SQS visibility and practical DLQ recovery |
-| 3 — Tenant isolation | Operator-managed SQL configuration, tenant-scoped secret references, isolation tests and simple CI |
-| 4 — Temporary AWS deployment | One readable Terraform root, minimal ECS/RDS/SQS/ALB infrastructure, scoped IAM and HTTPS in us-west-2 |
-| 5 — Operational verification | Useful logs/alarms, failure and recovery checks, bounded load measurements and lightweight deployment procedures |
-| 6 — Portfolio and cleanup | Record real evidence, document tradeoffs, destroy and inspect billable resources |
+| Two ECS services, each with one running task | [ECS services](docs/screenshots/ECS_cluster.png) |
+| API target healthy on port 8000 | [ALB target](docs/screenshots/ALB_Target.png) |
+| GitHub push accepted with HTTP 202 | [Accepted webhook](docs/screenshots/Github_Webhook.png) |
+| Slack received the notification | [Slack notification](docs/screenshots/Slack_notification.png) |
+| Same GitHub delivery returned HTTP 200 and `duplicate` | [Duplicate handling](docs/screenshots/Github_duplicate.png) |
 
-Security and tests are part of every stage. Delivery attempts are at least once;
-Slack notifications can duplicate after uncertain outcomes. The project does
-not promise exactly-once delivery. Configuration is managed by the operator
-through SQL; there is no public management API or separate API-key system.
-Keep explicit SQL and the existing codebase instead of adding frameworks.
-The AWS plan is a temporary demonstration with documented availability and
-networking tradeoffs, not a continuously running production service.
+The AWS demonstration was verified on November 14, 2026 (America/Los_Angeles).
+Both `/health` and `/health/db` also returned HTTP 200 through diagnostic TLS
+connections with certificate-chain and exact-domain verification. Normal custom-domain
+requests from the development network experienced DNS/TLS failures; the cause
+was not conclusively identified. GitHub reached the HTTPS endpoint successfully.
+
+AWS worker-outage recovery, controlled retry/DLQ recovery, load measurements,
+and final teardown have **not** been verified. Local automated failure tests
+are separate evidence from cloud operational tests. Screenshots record the demo,
+not a guarantee that the endpoint remains available.
+
+## Deployment lessons and limitations
+
+The first GitHub delivery returned 503 because the restricted database role lacked
+the column-level UPDATE privilege required by `SELECT ... FOR SHARE` on configuration
+tables. A one-off bootstrap task repaired RDS grants and verified permissions before
+commit. The bootstrap script and regression test now include the fix.
+
+The uploaded `demo-001` image predates that fix. The running database is repaired;
+build a new immutable image tag before bootstrapping another environment.
+
+Fargate tasks use public IPs for outbound access, with restricted inbound security
+groups; RDS is private. The demo has no NAT Gateway, interface endpoints, autoscaling,
+or multi-AZ database failover. Database TLS uses `require`, which encrypts traffic
+but does not verify server identity. CloudWatch logs are configured; custom alarms
+and throughput/availability claims are outside the verified scope.
+
+ALB, RDS, Fargate, public IPv4, and storage incur charges. After evidence collection,
+follow the reviewed teardown procedure and inspect remaining resources. Teardown
+has not yet been recorded as complete.
 
 ## Prerequisites
 
@@ -162,14 +225,14 @@ The explicit `outbox` table follows the Step 2 decision, replacing the earlier
 architecture suggestion to reuse delivery rows for publication. Ingestion
 inserts the event, deliveries, and outbox rows in one transaction. Publication
 and notification status are independent. The publisher uses
-transactional row locking; worker lease tokens will identify individual claims so
+transactional row locking; worker lease tokens identify individual claims so
 stale workers cannot overwrite a newer claim. The publisher and delivery worker
 include failure handling and retries. Tenant/source/destination/rule configuration
 uses explicit operator-run SQL, as shown in the local demonstration below.
 
 Secret reference columns must identify recoverable values in a secure secret
-store; they must not contain raw GitHub secrets or Slack webhook URLs. The secret
-store implementation is deferred. Error fields should contain only sanitized
+store; they must not contain raw GitHub secrets or Slack webhook URLs. AWS uses
+SSM SecureString values injected by ECS; local development uses environment variables. Error fields should contain only sanitized
 messages, never secrets or sensitive payloads. Applications must still authenticate
 webhooks and scope queries by tenant; foreign keys do not provide read isolation.
 
@@ -241,7 +304,8 @@ duplicates. The worker handles terminal jobs without resending; publication is n
 
 Set these values in `.env` before enabling the publisher:
 
-- `AWS_DEFAULT_REGION=us-west-2` (Oregon).
+- `AWS_DEFAULT_REGION`: the queue region (`us-east-2` for the AWS demo;
+  `us-west-2` for the local emulator examples below).
 - `SQS_QUEUE_URL`: the existing standard queue URL.
 - `SQS_ENDPOINT_URL`: blank for AWS, or a reachable local emulator endpoint.
 
@@ -682,26 +746,20 @@ The retry tests additionally exercise backoff, early duplicate receipts, final
 claim expiry, stale failure updates, database/visibility/deletion failures,
 `Retry-After` parsing and long delays, and real Moto/HTTP retry followed by success.
 
-Local queue/Compose stage verified on November 11, 2026: **97 tests passed in
-47.87 seconds**. `tests/test_local_sqs_setup.py` verifies queue attributes,
-repeatable updates that preserve messages, and Moto redrive after ten receives.
-Both the test image and queue-init image built successfully. Compose validation
-passed, and the actual `queue-init` command succeeded twice with the same queue
-URLs. The local `deliveries` and `deliveries-dlq` queues remain configured in Moto;
-`.env` was not modified. No worker was started against a real Slack destination.
+Recorded local verification:
 
-Previous retry-stage verification on November 11, 2026: **95 tests passed in 43.70 seconds** using
-PostgreSQL and Moto, including the existing ingestion/publisher/sender suite.
-The test image build, Compose configuration validation, and whitespace checks
-passed. The real queue-to-local-HTTP retry test waited for the persisted retry
-schedule and message visibility before succeeding. No AWS resources or real Slack
-notifications were used. DLQ recovery and cloud behavior remain unverified.
+- November 11, 2026: **97 tests passed in 47.87 seconds** against PostgreSQL
+  and Moto for the local queue/worker stage. This is a historical suite result,
+  not a fresh run of the entire current suite.
+- Final permission fix: **6 bootstrap tests passed in 2.78 seconds** against
+  isolated PostgreSQL 16. They verify migrations, transaction rollback, demo
+  routing, restricted-role grants, `FOR SHARE`, and denied configuration updates.
 
-Historical verification on November 10, 2026: **72 tests passed in 36.90 seconds** with
-PostgreSQL 16, Moto, and aiohttp 3.14.5. The test image built successfully and
-Compose configuration validation passed. This verifies the initial worker and
-sender plus the existing ingestion/publisher behavior; it does not verify real
-Slack delivery, AWS permissions, or the remaining retry/DLQ design.
+Bootstrap tests are opt-in (`RUN_BOOTSTRAP_DATABASE_TESTS=1`) and require an
+exclusive disposable local cluster with an administrator named something other
+than `webhook_app`. They create/drop temporary databases and that role, and skip
+if it already exists. The normal Compose/CI test command does not enable them.
+Never enable these tests against RDS or another shared database.
 
 Compose starts the local emulator automatically for tests and waits for its
 health check. In the publisher suite, five focused tests use a fake SQS sender; three integration tests
@@ -792,6 +850,9 @@ volume if you need to initialize with different settings, then start again.
 | `outbox_publisher.py` | PostgreSQL polling, SQS publication, and retries |
 | `delivery_worker.py` | SQS reception, database leases, and successful delivery completion |
 | `slack_sender.py` | Tenant-bound local secrets and restricted Slack HTTP delivery |
+| `bootstrap_database.py` | Explicit schema, restricted-role, and demo configuration bootstrap |
+| `tests/test_bootstrap_database.py` | Opt-in isolated database bootstrap and permissions tests |
+| `infra/` | Terraform configuration and AWS operations runbook |
 | `setup_local_sqs.py` | Explicit, repeatable Moto delivery queue and DLQ configuration |
 | `tests/test_local_sqs_setup.py` | Queue settings, repeatability, message preservation, and Moto redrive tests |
 | `tests/test_outbox_publisher.py` | PostgreSQL-backed publisher behavior tests |
@@ -805,4 +866,4 @@ volume if you need to initialize with different settings, then start again.
 | `.dockerignore` | Excludes secrets and generated files from the build context |
 | `.gitignore` | Excludes local secrets, environments, and generated files from Git |
 | `migrations/001_initial_schema.sql` | Initial tables, relationships, constraints, and indexes |
-| `docs/architecture.md` | Planned system architecture and development stages |
+| `docs/architecture.md` | Implemented architecture, guarantees, and limitations |
